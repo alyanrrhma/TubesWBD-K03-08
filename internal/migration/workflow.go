@@ -15,12 +15,14 @@ const (
 	WorkflowDraft    WorkflowStatus = "draft"
 	WorkflowInReview WorkflowStatus = "in_review"
 	WorkflowApproved WorkflowStatus = "approved"
+	WorkflowRejected WorkflowStatus = "rejected"
 	WorkflowExecuted WorkflowStatus = "executed"
 )
 
 var (
 	ErrWorkflowNotFound   = errors.New("migration workflow not found")
 	ErrWorkflowInvalid    = errors.New("invalid migration workflow operation")
+	ErrInvalidRevision    = errors.New("invalid migration revision input")
 	ErrIrreversibleReason = errors.New("irreversible migration requires a reason")
 	ErrRevisionImmutable  = errors.New("submitted or executed revision is immutable")
 	ErrApprovalIncomplete = errors.New("migration revision does not have all required approvals")
@@ -28,6 +30,7 @@ var (
 	ErrGroupLeaderMissing = errors.New("a database access group has no leader")
 	ErrNoApprovalGroups   = errors.New("migration database has no group requiring approval")
 	ErrLeaderMustBeMember = errors.New("group leader must be a member of the group")
+	ErrApprovalDuplicate  = errors.New("group leader has already recorded a decision")
 )
 
 type MigrationDefinition struct {
@@ -67,6 +70,23 @@ type Approval struct {
 	DecidedAt  time.Time `json:"decided_at"`
 }
 
+type ReviewStatus struct {
+	DefinitionID       int64          `json:"definition_id"`
+	RevisionID         int64          `json:"revision_id"`
+	Revision           int64          `json:"revision"`
+	Status             WorkflowStatus `json:"status"`
+	RequiredApprovals  int            `json:"required_approvals"`
+	CompletedApprovals int            `json:"completed_approvals"`
+	RejectedApprovals  int            `json:"rejected_approvals"`
+	MissingLeaders     int            `json:"missing_leaders"`
+	Ready              bool           `json:"ready"`
+}
+
+type GroupLeader struct {
+	GroupID      int64  `json:"group_id"`
+	LeaderUserID *int64 `json:"leader_user_id"`
+}
+
 type RevisionInput struct {
 	Name               string
 	Description        string
@@ -91,15 +111,15 @@ func NewWorkflowService(db *sql.DB, authz Authorizer) *WorkflowService {
 }
 
 func validateRevisionInput(in RevisionInput) error {
-	if strings.TrimSpace(in.Name) == "" || len(in.Name) > 200 || strings.TrimSpace(in.UpSQL) == "" || len(in.UpSQL) > maxSQLBytes {
-		return ErrWorkflowInvalid
+	if strings.TrimSpace(in.Name) == "" || len(in.Name) > 200 || strings.TrimSpace(in.UpSQL) == "" || len(in.UpSQL) > maxSQLBytes || strings.ContainsRune(in.UpSQL, 0) {
+		return ErrInvalidRevision
 	}
 	if in.Irreversible {
 		if strings.TrimSpace(in.IrreversibleReason) == "" {
 			return ErrIrreversibleReason
 		}
-	} else if strings.TrimSpace(in.DownSQL) == "" || len(in.DownSQL) > maxSQLBytes {
-		return ErrWorkflowInvalid
+	} else if strings.TrimSpace(in.DownSQL) == "" || len(in.DownSQL) > maxSQLBytes || strings.ContainsRune(in.DownSQL, 0) {
+		return ErrInvalidRevision
 	}
 	return nil
 }
@@ -111,6 +131,20 @@ func (s *WorkflowService) canEdit(ctx context.Context, userID, databaseID int64)
 	ok, err := s.Authz.CanEdit(ctx, userID, databaseID)
 	if err != nil {
 		return fmt.Errorf("check edit access: %w", err)
+	}
+	if !ok {
+		return ErrForbidden
+	}
+	return nil
+}
+
+func (s *WorkflowService) canView(ctx context.Context, userID, databaseID int64) error {
+	if userID <= 0 || databaseID <= 0 || s.Authz == nil {
+		return ErrInvalidArgument
+	}
+	ok, err := s.Authz.CanView(ctx, userID, databaseID)
+	if err != nil {
+		return fmt.Errorf("check view access: %w", err)
 	}
 	if !ok {
 		return ErrForbidden
@@ -148,6 +182,65 @@ func (s *WorkflowService) UpdateMigration(ctx context.Context, userID, definitio
 	return s.Repo.AppendRevision(ctx, userID, definitionID, in)
 }
 
+func (s *WorkflowService) ListMigrations(ctx context.Context, userID, databaseID int64) ([]MigrationDefinition, error) {
+	if err := s.canView(ctx, userID, databaseID); err != nil {
+		return nil, err
+	}
+	return s.Repo.ListDefinitions(ctx, databaseID)
+}
+
+func (s *WorkflowService) GetMigration(ctx context.Context, userID, definitionID int64) (MigrationDefinition, error) {
+	if userID <= 0 || definitionID <= 0 {
+		return MigrationDefinition{}, ErrInvalidArgument
+	}
+	d, err := s.Repo.GetDefinition(ctx, definitionID)
+	if err != nil {
+		return d, err
+	}
+	if err := s.canView(ctx, userID, d.DatabaseID); err != nil {
+		return d, err
+	}
+	return d, nil
+}
+
+func (s *WorkflowService) ListRevisions(ctx context.Context, userID, definitionID int64) ([]MigrationRevision, error) {
+	d, err := s.GetMigration(ctx, userID, definitionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.Repo.ListRevisions(ctx, d.ID)
+}
+
+func (s *WorkflowService) GetRevision(ctx context.Context, userID, definitionID, revision int64) (MigrationRevision, error) {
+	d, err := s.GetMigration(ctx, userID, definitionID)
+	if err != nil {
+		return MigrationRevision{}, err
+	}
+	return s.Repo.GetRevision(ctx, d.ID, revision)
+}
+
+func (s *WorkflowService) ReviewStatus(ctx context.Context, userID, definitionID int64) (ReviewStatus, error) {
+	d, err := s.GetMigration(ctx, userID, definitionID)
+	if err != nil {
+		return ReviewStatus{}, err
+	}
+	return s.Repo.ReviewStatus(ctx, d.ID)
+}
+
+func (s *WorkflowService) ListApprovals(ctx context.Context, userID, definitionID, revision int64) ([]Approval, error) {
+	if _, err := s.GetRevision(ctx, userID, definitionID, revision); err != nil {
+		return nil, err
+	}
+	return s.Repo.ListApprovals(ctx, definitionID, revision)
+}
+
+func (s *WorkflowService) GetGroupLeader(ctx context.Context, groupID int64) (GroupLeader, error) {
+	if groupID <= 0 {
+		return GroupLeader{}, ErrInvalidArgument
+	}
+	return s.Repo.GetGroupLeader(ctx, groupID)
+}
+
 func (s *WorkflowService) SubmitReview(ctx context.Context, userID, definitionID int64) (MigrationRevision, error) {
 	if definitionID <= 0 || userID <= 0 {
 		return MigrationRevision{}, ErrInvalidArgument
@@ -167,6 +260,28 @@ func (s *WorkflowService) Approve(ctx context.Context, userID, revisionID, group
 		return Approval{}, false, ErrInvalidArgument
 	}
 	return s.Repo.Approve(ctx, userID, revisionID, groupID)
+}
+
+func (s *WorkflowService) ApproveForDefinition(ctx context.Context, userID, definitionID, revisionNumber, groupID int64) (Approval, bool, error) {
+	if userID <= 0 || definitionID <= 0 || revisionNumber <= 0 || groupID <= 0 {
+		return Approval{}, false, ErrInvalidArgument
+	}
+	v, err := s.Repo.GetRevision(ctx, definitionID, revisionNumber)
+	if err != nil {
+		return Approval{}, false, err
+	}
+	return s.Repo.Approve(ctx, userID, v.ID, groupID)
+}
+
+func (s *WorkflowService) RejectForDefinition(ctx context.Context, userID, definitionID, revisionNumber, groupID int64) (Approval, error) {
+	if userID <= 0 || definitionID <= 0 || revisionNumber <= 0 || groupID <= 0 {
+		return Approval{}, ErrInvalidArgument
+	}
+	v, err := s.Repo.GetRevision(ctx, definitionID, revisionNumber)
+	if err != nil {
+		return Approval{}, err
+	}
+	return s.Repo.Reject(ctx, userID, v.ID, groupID)
 }
 
 // ApprovedRevision is the domain execution gate. A submit-job handler must call
@@ -230,6 +345,104 @@ func (r WorkflowRepository) GetDefinition(ctx context.Context, id int64) (Migrat
 	return d, err
 }
 
+func (r WorkflowRepository) ListDefinitions(ctx context.Context, databaseID int64) ([]MigrationDefinition, error) {
+	rows, err := r.DB.QueryContext(ctx, `SELECT d.id,d.database_id,d.name,d.description,d.created_by,d.workflow_status,d.created_at,d.updated_at,COALESCE(MAX(r.revision),0)
+		FROM migration_definitions d LEFT JOIN migration_revisions r ON r.definition_id=d.id WHERE d.database_id=$1
+		GROUP BY d.id ORDER BY d.updated_at DESC,d.id DESC`, databaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]MigrationDefinition, 0)
+	for rows.Next() {
+		var d MigrationDefinition
+		if err = rows.Scan(&d.ID, &d.DatabaseID, &d.Name, &d.Description, &d.CreatedBy, &d.WorkflowStatus, &d.CreatedAt, &d.UpdatedAt, &d.Revision); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (r WorkflowRepository) ListRevisions(ctx context.Context, definitionID int64) ([]MigrationRevision, error) {
+	rows, err := r.DB.QueryContext(ctx, `SELECT id,definition_id,revision,up_sql,COALESCE(down_sql,''),irreversible,COALESCE(irreversible_reason,''),workflow_status,created_by,created_at,submitted_at,executed_at,COALESCE(execution_id,'') FROM migration_revisions WHERE definition_id=$1 ORDER BY revision DESC`, definitionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]MigrationRevision, 0)
+	for rows.Next() {
+		var v MigrationRevision
+		if err = rows.Scan(&v.ID, &v.DefinitionID, &v.Revision, &v.UpSQL, &v.DownSQL, &v.Irreversible, &v.IrreversibleReason, &v.WorkflowStatus, &v.CreatedBy, &v.CreatedAt, &v.SubmittedAt, &v.ExecutedAt, &v.ExecutionID); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+func (r WorkflowRepository) GetRevision(ctx context.Context, definitionID, revision int64) (MigrationRevision, error) {
+	var v MigrationRevision
+	err := r.DB.QueryRowContext(ctx, `SELECT id,definition_id,revision,up_sql,COALESCE(down_sql,''),irreversible,COALESCE(irreversible_reason,''),workflow_status,created_by,created_at,submitted_at,executed_at,COALESCE(execution_id,'') FROM migration_revisions WHERE definition_id=$1 AND revision=$2`, definitionID, revision).
+		Scan(&v.ID, &v.DefinitionID, &v.Revision, &v.UpSQL, &v.DownSQL, &v.Irreversible, &v.IrreversibleReason, &v.WorkflowStatus, &v.CreatedBy, &v.CreatedAt, &v.SubmittedAt, &v.ExecutedAt, &v.ExecutionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return v, ErrWorkflowNotFound
+	}
+	return v, err
+}
+
+func (r WorkflowRepository) ReviewStatus(ctx context.Context, definitionID int64) (ReviewStatus, error) {
+	var s ReviewStatus
+	err := r.DB.QueryRowContext(ctx, `SELECT d.id,r.id,r.revision,r.workflow_status,
+		(SELECT COUNT(*) FROM migration_review_groups rg WHERE rg.revision_id=r.id),
+		(SELECT COUNT(*) FROM migration_review_groups rg JOIN migration_approvals a ON a.revision_id=rg.revision_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='approved' WHERE rg.revision_id=r.id),
+		(SELECT COUNT(*) FROM migration_review_groups rg JOIN migration_approvals a ON a.revision_id=rg.revision_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='rejected' WHERE rg.revision_id=r.id),
+		CASE WHEN r.workflow_status='draft' THEN (SELECT COUNT(*) FROM group_database_access ga JOIN app_groups g ON g.id=ga.group_id WHERE ga.database_id=d.database_id AND g.leader_user_id IS NULL) ELSE 0 END
+		FROM migration_definitions d JOIN LATERAL (SELECT * FROM migration_revisions WHERE definition_id=d.id ORDER BY revision DESC LIMIT 1) r ON TRUE WHERE d.id=$1`, definitionID).
+		Scan(&s.DefinitionID, &s.RevisionID, &s.Revision, &s.Status, &s.RequiredApprovals, &s.CompletedApprovals, &s.RejectedApprovals, &s.MissingLeaders)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s, ErrWorkflowNotFound
+	}
+	if err != nil {
+		return s, err
+	}
+	s.Ready = s.Status == WorkflowApproved && s.RequiredApprovals > 0 && s.CompletedApprovals == s.RequiredApprovals && s.MissingLeaders == 0
+	return s, nil
+}
+
+func (r WorkflowRepository) ListApprovals(ctx context.Context, definitionID, revision int64) ([]Approval, error) {
+	rows, err := r.DB.QueryContext(ctx, `SELECT a.id,a.revision_id,a.group_id,a.user_id,a.decision,a.decided_at FROM migration_approvals a JOIN migration_revisions r ON r.id=a.revision_id WHERE r.definition_id=$1 AND r.revision=$2 ORDER BY a.group_id,a.decided_at`, definitionID, revision)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Approval, 0)
+	for rows.Next() {
+		var a Approval
+		if err = rows.Scan(&a.ID, &a.RevisionID, &a.GroupID, &a.UserID, &a.Decision, &a.DecidedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (r WorkflowRepository) GetGroupLeader(ctx context.Context, groupID int64) (GroupLeader, error) {
+	var g GroupLeader
+	var userID sql.NullInt64
+	err := r.DB.QueryRowContext(ctx, `SELECT id,leader_user_id FROM app_groups WHERE id=$1`, groupID).Scan(&g.GroupID, &userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return g, ErrWorkflowNotFound
+	}
+	if err != nil {
+		return g, err
+	}
+	if userID.Valid {
+		g.LeaderUserID = &userID.Int64
+	}
+	return g, nil
+}
+
 func (r WorkflowRepository) AppendRevision(ctx context.Context, userID, definitionID int64, in RevisionInput) (MigrationRevision, error) {
 	tx, err := r.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -244,9 +457,14 @@ func (r WorkflowRepository) AppendRevision(ctx context.Context, userID, definiti
 		return MigrationRevision{}, err
 	}
 	var rev int64
-	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(revision),0)+1 FROM migration_revisions WHERE definition_id=$1`, definitionID).Scan(&rev); err != nil {
+	var latestStatus WorkflowStatus
+	if err = tx.QueryRowContext(ctx, `SELECT revision,workflow_status FROM migration_revisions WHERE definition_id=$1 ORDER BY revision DESC LIMIT 1 FOR UPDATE`, definitionID).Scan(&rev, &latestStatus); err != nil {
 		return MigrationRevision{}, err
 	}
+	if latestStatus == WorkflowInReview {
+		return MigrationRevision{}, ErrRevisionImmutable
+	}
+	rev++
 	if _, err = tx.ExecContext(ctx, `UPDATE migration_definitions SET name=$2,description=$3,workflow_status='draft',updated_at=NOW() WHERE id=$1`, definitionID, strings.TrimSpace(in.Name), in.Description); err != nil {
 		return MigrationRevision{}, err
 	}
@@ -303,20 +521,42 @@ func (r WorkflowRepository) SubmitReview(ctx context.Context, definitionID int64
 	if v.WorkflowStatus != WorkflowDraft {
 		return v, ErrRevisionImmutable
 	}
-	var missing bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_database_access a JOIN migration_definitions d ON d.database_id=a.database_id
-		JOIN app_groups g ON g.id=a.group_id WHERE d.id=$1 AND g.leader_user_id IS NULL)`, definitionID).Scan(&missing); err != nil {
+	rows, err := tx.QueryContext(ctx, `SELECT ga.group_id,g.leader_user_id FROM group_database_access ga
+		JOIN migration_definitions d ON d.database_id=ga.database_id JOIN app_groups g ON g.id=ga.group_id
+		WHERE d.id=$1 ORDER BY ga.group_id FOR SHARE OF ga,g`, definitionID)
+	if err != nil {
 		return v, err
 	}
-	if missing {
-		return v, ErrGroupLeaderMissing
+	type requiredApprover struct {
+		groupID  int64
+		leaderID sql.NullInt64
 	}
-	var hasGroups bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_definitions d JOIN group_database_access a ON a.database_id=d.database_id WHERE d.id=$1)`, definitionID).Scan(&hasGroups); err != nil {
+	var required []requiredApprover
+	for rows.Next() {
+		var item requiredApprover
+		if err = rows.Scan(&item.groupID, &item.leaderID); err != nil {
+			rows.Close()
+			return v, err
+		}
+		required = append(required, item)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
 		return v, err
 	}
-	if !hasGroups {
+	if err = rows.Close(); err != nil {
+		return v, err
+	}
+	if len(required) == 0 {
 		return v, ErrNoApprovalGroups
+	}
+	for _, item := range required {
+		if !item.leaderID.Valid {
+			return v, ErrGroupLeaderMissing
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO migration_review_groups(revision_id,group_id,leader_user_id) VALUES($1,$2,$3)`, v.ID, item.groupID, item.leaderID.Int64); err != nil {
+			return v, err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE migration_revisions SET workflow_status='in_review',submitted_at=NOW() WHERE id=$1`, v.ID); err != nil {
 		return v, err
@@ -340,9 +580,9 @@ func (r WorkflowRepository) Approve(ctx context.Context, userID, revisionID, gro
 		return Approval{}, false, err
 	}
 	defer tx.Rollback()
-	var databaseID, definitionID int64
+	var definitionID int64
 	var status WorkflowStatus
-	err = tx.QueryRowContext(ctx, `SELECT d.database_id,d.id,r.workflow_status FROM migration_revisions r JOIN migration_definitions d ON d.id=r.definition_id WHERE r.id=$1 FOR UPDATE OF r`, revisionID).Scan(&databaseID, &definitionID, &status)
+	err = tx.QueryRowContext(ctx, `SELECT d.id,r.workflow_status FROM migration_revisions r JOIN migration_definitions d ON d.id=r.definition_id WHERE r.id=$1 FOR UPDATE OF r`, revisionID).Scan(&definitionID, &status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Approval{}, false, ErrWorkflowNotFound
 	}
@@ -352,15 +592,15 @@ func (r WorkflowRepository) Approve(ctx context.Context, userID, revisionID, gro
 	if status != WorkflowInReview {
 		return Approval{}, false, ErrWorkflowInvalid
 	}
-	var leader sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT g.leader_user_id FROM app_groups g JOIN group_database_access a ON a.group_id=g.id AND a.database_id=$2 WHERE g.id=$1 FOR UPDATE OF g`, groupID, databaseID).Scan(&leader)
+	var leader int64
+	err = tx.QueryRowContext(ctx, `SELECT leader_user_id FROM migration_review_groups WHERE revision_id=$1 AND group_id=$2 FOR UPDATE`, revisionID, groupID).Scan(&leader)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Approval{}, false, ErrNotGroupLeader
 		}
 		return Approval{}, false, err
 	}
-	if !leader.Valid || leader.Int64 != userID {
+	if leader != userID {
 		return Approval{}, false, ErrNotGroupLeader
 	}
 	var a Approval
@@ -368,16 +608,15 @@ func (r WorkflowRepository) Approve(ctx context.Context, userID, revisionID, gro
 		ON CONFLICT(revision_id,group_id,user_id) DO NOTHING
 		RETURNING id,revision_id,group_id,user_id,decision,decided_at`, revisionID, groupID, userID).Scan(&a.ID, &a.RevisionID, &a.GroupID, &a.UserID, &a.Decision, &a.DecidedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		err = tx.QueryRowContext(ctx, `SELECT id,revision_id,group_id,user_id,decision,decided_at FROM migration_approvals WHERE revision_id=$1 AND group_id=$2 AND user_id=$3`, revisionID, groupID, userID).Scan(&a.ID, &a.RevisionID, &a.GroupID, &a.UserID, &a.Decision, &a.DecidedAt)
+		return Approval{}, false, ErrApprovalDuplicate
 	}
 	if err != nil {
 		return a, false, fmt.Errorf("record approval: %w", err)
 	}
 	var complete bool
-	err = tx.QueryRowContext(ctx, `SELECT NOT EXISTS(
-		SELECT 1 FROM migration_definitions d JOIN group_database_access ga ON ga.database_id=d.database_id
-		LEFT JOIN app_groups g ON g.id=ga.group_id LEFT JOIN migration_approvals ma ON ma.revision_id=$2 AND ma.group_id=ga.group_id AND ma.user_id=g.leader_user_id AND ma.decision='approved'
-		WHERE d.id=$1 AND (g.leader_user_id IS NULL OR ma.id IS NULL))`, definitionID, revisionID).Scan(&complete)
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_review_groups WHERE revision_id=$1)
+		AND NOT EXISTS(SELECT 1 FROM migration_review_groups rg LEFT JOIN migration_approvals ma ON ma.revision_id=rg.revision_id AND ma.group_id=rg.group_id AND ma.user_id=rg.leader_user_id AND ma.decision='approved'
+		WHERE rg.revision_id=$1 AND ma.id IS NULL)`, revisionID).Scan(&complete)
 	if err != nil {
 		return a, false, err
 	}
@@ -393,6 +632,56 @@ func (r WorkflowRepository) Approve(ctx context.Context, userID, revisionID, gro
 		return a, false, err
 	}
 	return a, complete, nil
+}
+
+func (r WorkflowRepository) Reject(ctx context.Context, userID, revisionID, groupID int64) (Approval, error) {
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Approval{}, err
+	}
+	defer tx.Rollback()
+	var definitionID int64
+	var status WorkflowStatus
+	err = tx.QueryRowContext(ctx, `SELECT d.id,r.workflow_status FROM migration_revisions r JOIN migration_definitions d ON d.id=r.definition_id WHERE r.id=$1 FOR UPDATE OF r`, revisionID).Scan(&definitionID, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Approval{}, ErrWorkflowNotFound
+	}
+	if err != nil {
+		return Approval{}, err
+	}
+	if status != WorkflowInReview {
+		return Approval{}, ErrWorkflowInvalid
+	}
+	var leader int64
+	err = tx.QueryRowContext(ctx, `SELECT leader_user_id FROM migration_review_groups WHERE revision_id=$1 AND group_id=$2 FOR UPDATE`, revisionID, groupID).Scan(&leader)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Approval{}, ErrNotGroupLeader
+	}
+	if err != nil {
+		return Approval{}, err
+	}
+	if leader != userID {
+		return Approval{}, ErrNotGroupLeader
+	}
+	var approval Approval
+	err = tx.QueryRowContext(ctx, `INSERT INTO migration_approvals(revision_id,group_id,user_id,decision) VALUES($1,$2,$3,'rejected') ON CONFLICT(revision_id,group_id,user_id) DO NOTHING
+		RETURNING id,revision_id,group_id,user_id,decision,decided_at`, revisionID, groupID, userID).Scan(&approval.ID, &approval.RevisionID, &approval.GroupID, &approval.UserID, &approval.Decision, &approval.DecidedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Approval{}, ErrApprovalDuplicate
+	}
+	if err != nil {
+		return Approval{}, fmt.Errorf("record rejection: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE migration_revisions SET workflow_status='rejected' WHERE id=$1`, revisionID); err != nil {
+		return Approval{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE migration_definitions SET workflow_status='rejected',updated_at=NOW() WHERE id=$1`, definitionID); err != nil {
+		return Approval{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return Approval{}, err
+	}
+	return approval, nil
 }
 
 func (r WorkflowRepository) ApprovedRevision(ctx context.Context, definitionID int64) (MigrationRevision, error) {
@@ -411,10 +700,9 @@ func (r WorkflowRepository) ApprovedRevision(ctx context.Context, definitionID i
 		return v, ErrApprovalIncomplete
 	}
 	var complete bool
-	err = r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_database_access ga JOIN migration_definitions d ON d.database_id=ga.database_id WHERE d.id=$1)
-		AND NOT EXISTS(SELECT 1 FROM group_database_access ga JOIN migration_definitions d ON d.database_id=ga.database_id
-		LEFT JOIN app_groups g ON g.id=ga.group_id LEFT JOIN migration_approvals a ON a.revision_id=$2 AND a.group_id=ga.group_id AND a.user_id=g.leader_user_id AND a.decision='approved'
-		WHERE d.id=$1 AND (g.leader_user_id IS NULL OR a.id IS NULL))`, definitionID, v.ID).Scan(&complete)
+	err = r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_review_groups WHERE revision_id=$1)
+		AND NOT EXISTS(SELECT 1 FROM migration_review_groups rg LEFT JOIN migration_approvals a ON a.revision_id=rg.revision_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='approved'
+		WHERE rg.revision_id=$1 AND a.id IS NULL)`, v.ID).Scan(&complete)
 	if err != nil {
 		return v, err
 	}
@@ -446,10 +734,9 @@ func (r WorkflowRepository) MarkExecuted(ctx context.Context, definitionID, revi
 		return v, ErrApprovalIncomplete
 	}
 	var complete bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_database_access ga JOIN migration_definitions d ON d.database_id=ga.database_id WHERE d.id=$1)
-		AND NOT EXISTS(SELECT 1 FROM group_database_access ga JOIN migration_definitions d ON d.database_id=ga.database_id
-		LEFT JOIN app_groups g ON g.id=ga.group_id LEFT JOIN migration_approvals a ON a.revision_id=$2 AND a.group_id=ga.group_id AND a.user_id=g.leader_user_id AND a.decision='approved'
-		WHERE d.id=$1 AND (g.leader_user_id IS NULL OR a.id IS NULL))`, definitionID, revisionID).Scan(&complete); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_review_groups WHERE revision_id=$1)
+		AND NOT EXISTS(SELECT 1 FROM migration_review_groups rg LEFT JOIN migration_approvals a ON a.revision_id=rg.revision_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='approved'
+		WHERE rg.revision_id=$1 AND a.id IS NULL)`, revisionID).Scan(&complete); err != nil {
 		return v, err
 	}
 	if !complete {

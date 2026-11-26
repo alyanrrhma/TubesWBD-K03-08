@@ -113,6 +113,9 @@ func TestWorkflowSubmittedRevisionIsImmutable(t *testing.T) {
 	if _, err = f.svc.SubmitReview(ctx, f.user1, d.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = f.svc.UpdateMigration(ctx, f.user1, d.ID, validRevision("must not replace submitted")); !errors.Is(err, ErrRevisionImmutable) {
+		t.Fatalf("want ErrRevisionImmutable while review is pending, got %v", err)
+	}
 	if _, err = f.db.Exec(`UPDATE migration_revisions SET up_sql='DROP TABLE users' WHERE id=$1`, v.ID); err == nil {
 		t.Fatal("submitted revision SQL update unexpectedly succeeded")
 	}
@@ -141,8 +144,18 @@ func TestWorkflowReviewPartialAndCompleteApproval(t *testing.T) {
 	if err != nil || complete {
 		t.Fatalf("partial approval complete=%v err=%v", complete, err)
 	}
+	if _, _, err = f.svc.Approve(ctx, f.user1, v.ID, f.group1); !errors.Is(err, ErrApprovalDuplicate) {
+		t.Fatalf("want duplicate approval error, got %v", err)
+	}
 	if _, err = f.svc.ApprovedRevision(ctx, d.ID); !errors.Is(err, ErrApprovalIncomplete) {
 		t.Fatalf("want incomplete, got %v", err)
+	}
+	if _, err = f.db.Exec(`DELETE FROM group_database_access WHERE group_id=$1 AND database_id=$2`, f.group2, f.databaseID); err != nil {
+		t.Fatal(err)
+	}
+	status, err := f.svc.ReviewStatus(ctx, f.user1, d.ID)
+	if err != nil || status.RequiredApprovals != 2 || status.CompletedApprovals != 1 {
+		t.Fatalf("review obligations changed after submission: status=%+v err=%v", status, err)
 	}
 	_, complete, err = f.svc.Approve(ctx, f.user2, v.ID, f.group2)
 	if err != nil || !complete {
@@ -170,6 +183,29 @@ func TestWorkflowApprovalRejectsNonLeader(t *testing.T) {
 	}
 	if _, _, err = f.svc.Approve(ctx, f.nonLeader, v.ID, f.group1); !errors.Is(err, ErrNotGroupLeader) {
 		t.Fatalf("want ErrNotGroupLeader, got %v", err)
+	}
+}
+
+func TestWorkflowRejectRecordsLeaderAndMakesRevisionTerminal(t *testing.T) {
+	f := workflowSetup(t, true)
+	ctx := context.Background()
+	d, v, err := f.svc.CreateMigration(ctx, f.user1, f.databaseID, validRevision("reject me"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.svc.SubmitReview(ctx, f.user1, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := f.svc.RejectForDefinition(ctx, f.user2, d.ID, v.Revision, f.group2)
+	if err != nil || decision.Decision != "rejected" || decision.UserID != f.user2 {
+		t.Fatalf("decision=%+v err=%v", decision, err)
+	}
+	status, err := f.svc.ReviewStatus(ctx, f.user1, d.ID)
+	if err != nil || status.Status != WorkflowRejected || status.RejectedApprovals != 1 || status.Ready {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if _, _, err = f.svc.Approve(ctx, f.user1, v.ID, f.group1); !errors.Is(err, ErrWorkflowInvalid) {
+		t.Fatalf("want terminal workflow error, got %v", err)
 	}
 }
 
