@@ -34,11 +34,42 @@ async function api(page, method, path, body) {
   }, { method, path, body });
 }
 
+async function waitForVisibleJob(page) {
+  const region = page.locator("[data-job-status]");
+  await expect(region).toHaveAttribute("data-job-id", /.+/);
+  const jobID = await region.getAttribute("data-job-id");
+  let job;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const statusResponse = await api(page, "GET", `/api/jobs/${jobID}`);
+    job = statusResponse.job || statusResponse;
+    if (["success", "failed", "partial", "partially_reverted", "uncertain"].includes(String(job.status).toLowerCase())) break;
+    await page.waitForTimeout(250);
+  }
+  expect(job.status).toBe("success");
+  await expect(region).toContainText("Berhasil");
+  return job;
+}
+
+async function approveOperationInUI(page, operation) {
+  const decision = page.locator(`[data-op-review-decision="approved"]`).first();
+  await expect(decision).toBeVisible();
+  await decision.click();
+  const submit = page.getByRole("button", { name: `Antrekan ${operation} yang disetujui` });
+  await expect(submit).toBeVisible();
+  await submit.click();
+  return waitForVisibleJob(page);
+}
+
 test("login screen fits viewport and serves SPA shell", async ({ page }) => {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("response", (response) => {
-    if (response.status() >= 400 && !(response.status() === 401 && new URL(response.url()).pathname === "/api/auth/me")) {
+    const path = new URL(response.url()).pathname;
+    const expectedAnonymousSession = response.status() === 401 && path === "/api/auth/me";
+    const expectedMissingOperationReview = response.status() === 404
+      && response.request().method() === "GET"
+      && /\/operations\/(rollback|forward)\/review$/.test(path);
+    if (response.status() >= 400 && !expectedAnonymousSession && !expectedMissingOperationReview) {
       errors.push(`${response.status()} ${response.url()}`);
     }
   });
@@ -55,7 +86,12 @@ test("authenticated SPA pages remain usable at configured viewport", async ({ pa
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("response", (response) => {
-    if (response.status() >= 400 && !(response.status() === 401 && new URL(response.url()).pathname === "/api/auth/me")) {
+    const path = new URL(response.url()).pathname;
+    const expectedAnonymousSession = response.status() === 401 && path === "/api/auth/me";
+    const expectedMissingOperationReview = response.status() === 404
+      && response.request().method() === "GET"
+      && /\/operations\/(rollback|forward)\/review$/.test(path);
+    if (response.status() >= 400 && !expectedAnonymousSession && !expectedMissingOperationReview) {
       errors.push(`${response.status()} ${response.url()}`);
     }
   });
@@ -92,7 +128,6 @@ test("authenticated SPA pages remain usable at configured viewport", async ({ pa
 
   if (targetDatabase && isAdmin) {
     const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const session = await api(page, "GET", "/api/auth/me");
     const connectionResponse = await api(page, "POST", "/api/admin/connections", {
       name: `browser_${suffix}`,
       host: process.env.BROWSER_TARGET_HOST || "127.0.0.1",
@@ -107,44 +142,87 @@ test("authenticated SPA pages remain usable at configured viewport", async ({ pa
     const groupResponse = await api(page, "POST", "/api/admin/groups", { name: `browser_${suffix}` });
     const group = groupResponse.group || groupResponse;
     const groupID = group.ID ?? group.id;
+    const session = await api(page, "GET", "/api/auth/me");
     await api(page, "POST", `/api/admin/groups/${groupID}/members`, { user_id: session.user.id });
     await api(page, "PUT", `/api/admin/groups/${groupID}/leader`, { user_id: session.user.id });
     await api(page, "POST", `/api/admin/groups/${groupID}/access`, { database_id: connectionID, level: "VIEW_EDIT" });
 
-    const tableName = `qa_${suffix}`;
-    const created = await api(page, "POST", `/api/databases/${connectionID}/migrations`, {
-      name: `browser migration ${suffix}`,
-      description: "Playwright responsive and queue verification",
-      up_sql: `CREATE TABLE public."${tableName}" (id bigint PRIMARY KEY)`,
-      down_sql: `DROP TABLE public."${tableName}"`,
-      irreversible: false,
+    const helperUsername = `member_${suffix}`;
+    const helperUserResponse = await api(page, "POST", "/api/admin/users", {
+      username: helperUsername,
+      password: "BrowserMemberPass2026!",
+      is_platform_admin: false,
     });
-    const definitionID = created.migration.id ?? created.migration.ID;
-    await api(page, "POST", `/api/migrations/${definitionID}/submit-review`, {});
-    await api(page, "POST", `/api/migrations/${definitionID}/revisions/1/approvals`, { group_id: groupID });
-    const readiness = await api(page, "GET", `/api/migrations/${definitionID}/readiness`);
-    expect(readiness.ready).toBe(true);
-    const queued = await api(page, "POST", `/api/migrations/${definitionID}/submit`, {});
-    let job;
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      const statusResponse = await api(page, "GET", `/api/jobs/${queued.job_id}`);
-      job = statusResponse.job || statusResponse;
-      if (["success", "failed", "partial", "partially_reverted", "uncertain"].includes(String(job.status).toLowerCase())) break;
-      await page.waitForTimeout(250);
-    }
-    expect(job.status).toBe("success");
+    const helperUser = helperUserResponse.user || helperUserResponse;
+    await page.goto("/admin/groups");
+    const groupRow = page.getByRole("row").filter({ hasText: `browser_${suffix}` });
+    await groupRow.getByRole("button", { name: "Atur group" }).click();
+    const groupDetails = page.locator("#group-details");
+    await groupDetails.locator("#group-member").selectOption(String(helperUser.ID ?? helperUser.id));
+    await groupDetails.getByRole("button", { name: "Tambahkan anggota" }).click();
+    await expect(groupDetails.getByRole("list").getByText(helperUsername)).toBeVisible();
+    await groupDetails.locator("#group-leader").selectOption(String(session.user.id));
+    await groupDetails.getByRole("button", { name: "Simpan leader" }).click();
+    await expect(groupDetails.getByText("Leader approval berhasil diperbarui.")).toBeVisible();
+
+    const tableName = `qa_${suffix}`;
+    await page.goto(`/databases/${connectionID}/migrations`);
+    const draftForm = page.locator("[data-create-form-wrapper] [data-revision-form]");
+    await draftForm.locator('[name="name"]').fill(`browser migration ${suffix}`);
+    await draftForm.locator('[name="description"]').fill("Playwright responsive and queue verification");
+    await draftForm.locator('[name="up_sql"]').fill(`CREATE TABLE public."${tableName}" (id bigint PRIMARY KEY)`);
+    await draftForm.locator('[name="down_sql"]').fill(`DROP TABLE public."${tableName}"`);
+    await draftForm.getByRole("button", { name: "Simpan revision draft" }).click();
+    await expect(page.getByRole("heading", { name: `browser migration ${suffix}` })).toBeVisible();
+    const definitionID = await api(page, "GET", `/api/databases/${connectionID}/migrations`).then(result => {
+      const migration = (result.migrations || result.items || []).find(item => item.name === `browser migration ${suffix}`);
+      return migration?.id ?? migration?.ID;
+    });
+    expect(definitionID).toBeTruthy();
+    await page.getByRole("button", { name: "Kirim untuk review" }).click();
+    await expect(page.getByRole("button", { name: "Setujui" })).toBeVisible();
+    await page.getByRole("button", { name: "Setujui" }).click();
+    await expect(page.getByText("Semua persyaratan review terpenuhi.")).toBeVisible();
+    await page.once("dialog", dialog => dialog.accept());
+    await page.getByRole("button", { name: "Antrekan eksekusi yang disetujui" }).click();
+    await waitForVisibleJob(page);
+
+    await page.once("dialog", dialog => dialog.accept());
+    await page.locator('[data-enqueue-operation="rollback"]').click();
+    await expect(page.getByRole("heading", { name: /Review rollback/ })).toBeVisible();
+    await approveOperationInUI(page, "rollback");
+
+    await page.once("dialog", dialog => dialog.accept());
+    await page.locator('[data-enqueue-operation="forward"]').click();
+    await expect(page.getByRole("heading", { name: /Review forward/ })).toBeVisible();
+    await approveOperationInUI(page, "forward");
 
     await page.goto(`/databases/${connectionID}/migrations`);
     await expect(page.getByRole("heading", { name: "Migration", exact: true })).toBeVisible();
-    const historyDetail = page.getByRole("button", { name: "SQL / error" }).first();
+    const applyHistoryRow = page.getByRole("row").filter({ hasText: "apply" }).first();
+    const historyDetail = applyHistoryRow.getByRole("button", { name: "SQL / error" });
     await expect(historyDetail).toBeVisible();
     await historyDetail.click();
-    await expect(page.locator("tr[id^='execution-detail-'] pre").first()).toContainText(tableName);
+    const applyDetailRow = applyHistoryRow.locator("xpath=following-sibling::tr[1]");
+    if (!(await applyDetailRow.isVisible())) await historyDetail.click();
+    await expect(applyDetailRow).toBeVisible();
+    await expect(applyDetailRow.locator("pre")).toContainText(tableName);
     await page.getByLabel("Hide rollback").check();
     await expect(page.getByLabel("Hide rollback")).toBeChecked();
     await expectNoViewportOverflow(page);
+    await page.locator("#migration-sql").fill("SELECT 1");
+    await page.getByRole("button", { name: "Analisis execution plan" }).click();
+    await expect(page.locator("#migration-plan")).toBeVisible();
+    await expect(page.locator("#migration-plan-output")).not.toBeEmpty();
     await page.goto(`/databases/${connectionID}`);
     await expect(page.getByText(tableName, { exact: false }).first()).toBeVisible();
+    await expectNoViewportOverflow(page);
+
+    await page.goto("/admin/users");
+    const helperUserRow = page.getByRole("row").filter({ hasText: helperUsername });
+    await page.once("dialog", dialog => dialog.accept());
+    await helperUserRow.getByRole("button", { name: "Hapus" }).click();
+    await expect(page.getByRole("row").filter({ hasText: helperUsername })).toHaveCount(0);
     await expectNoViewportOverflow(page);
   }
   expect(errors).toEqual([]);
