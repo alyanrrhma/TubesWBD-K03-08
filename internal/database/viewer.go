@@ -6,10 +6,44 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5/pgconn"
+	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
+
+type queryAuditKey struct{}
+type queryAuditContext struct{ actorID, databaseID int64 }
+
+// WithQueryAuditContext associates a read-only target query with the HTTP
+// actor and registered database without passing those identifiers through SQL.
+func WithQueryAuditContext(ctx context.Context, actorID, databaseID int64) context.Context {
+	return context.WithValue(ctx, queryAuditKey{}, queryAuditContext{actorID: actorID, databaseID: databaseID})
+}
+
+func startAuditQuery(ctx context.Context, query string, parameters []any) time.Time {
+	meta, _ := ctx.Value(queryAuditKey{}).(queryAuditContext)
+	started := time.Now()
+	slog.Default().Info("sql_query_started", "event", "database.sql.read", "actor_id", meta.actorID, "database_id", meta.databaseID, "query", strings.TrimSpace(query), "parameters", parameters)
+	return started
+}
+
+func auditQuery(ctx context.Context, query string, parameters []any, started time.Time, rowCount int, err error) {
+	meta, _ := ctx.Value(queryAuditKey{}).(queryAuditContext)
+	attrs := []any{"event", "database.sql.read", "actor_id", meta.actorID, "database_id", meta.databaseID,
+		"query", strings.TrimSpace(query), "parameters", parameters, "duration_ms", time.Since(started).Milliseconds(), "row_count", rowCount}
+	if err != nil {
+		attrs = append(attrs, "status", "error", "error", err.Error())
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			attrs = append(attrs, "sqlstate", pgErr.Code)
+		}
+		slog.Default().Error("sql_query_finished", attrs...)
+		return
+	}
+	attrs = append(attrs, "status", "success")
+	slog.Default().Info("sql_query_finished", attrs...)
+}
 
 const (
 	queryTimeout       = 15 * time.Second
@@ -84,7 +118,7 @@ type TableData struct {
 }
 
 // ListTables mengambil daftar tabel biasa dalam sebuah schema.
-func ListTables(ctx context.Context, db *sql.DB, schema string) ([]Table, error) {
+func ListTables(ctx context.Context, db *sql.DB, schema string) (tables []Table, retErr error) {
 	if db == nil {
 		return nil, fmt.Errorf("database connection is nil")
 	}
@@ -92,19 +126,24 @@ func ListTables(ctx context.Context, db *sql.DB, schema string) ([]Table, error)
 		return nil, err
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	const query = `
 		SELECT table_schema, table_name
 		FROM information_schema.tables
 		WHERE table_schema = $1
 		  AND table_type = 'BASE TABLE'
 		ORDER BY table_name
-	`, schema)
+	`
+	started := startAuditQuery(ctx, query, []any{schema})
+	rows, err := db.QueryContext(ctx, query, schema)
 	if err != nil {
-		return nil, wrapQueryError("list tables", err)
+		retErr = wrapQueryError("list tables", err)
+		auditQuery(ctx, query, []any{schema}, started, 0, retErr)
+		return nil, retErr
 	}
 	defer rows.Close()
+	defer func() { auditQuery(ctx, query, []any{schema}, started, len(tables), retErr) }()
 
-	tables := make([]Table, 0)
+	tables = make([]Table, 0)
 
 	for rows.Next() {
 		var table Table
@@ -122,7 +161,7 @@ func ListTables(ctx context.Context, db *sql.DB, schema string) ([]Table, error)
 }
 
 // ListColumns mengambil daftar kolom dari tabel tertentu.
-func ListColumns(ctx context.Context, db *sql.DB, schema string, table string) ([]Column, error) {
+func ListColumns(ctx context.Context, db *sql.DB, schema string, table string) (columns []Column, retErr error) {
 	if db == nil {
 		return nil, fmt.Errorf("database connection is nil")
 	}
@@ -133,7 +172,7 @@ func ListColumns(ctx context.Context, db *sql.DB, schema string, table string) (
 		return nil, err
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	const query = `
 		SELECT
 			column_name,
 			data_type,
@@ -143,13 +182,18 @@ func ListColumns(ctx context.Context, db *sql.DB, schema string, table string) (
 		WHERE table_schema = $1
 		  AND table_name = $2
 		ORDER BY ordinal_position
-	`, schema, table)
+	`
+	started := startAuditQuery(ctx, query, []any{schema, table})
+	rows, err := db.QueryContext(ctx, query, schema, table)
 	if err != nil {
-		return nil, wrapQueryError("list columns", err)
+		retErr = wrapQueryError("list columns", err)
+		auditQuery(ctx, query, []any{schema, table}, started, 0, retErr)
+		return nil, retErr
 	}
 	defer rows.Close()
+	defer func() { auditQuery(ctx, query, []any{schema, table}, started, len(columns), retErr) }()
 
-	columns := make([]Column, 0)
+	columns = make([]Column, 0)
 
 	for rows.Next() {
 		var column Column
@@ -177,12 +221,12 @@ func ListColumns(ctx context.Context, db *sql.DB, schema string, table string) (
 
 // ListSchemas mengambil daftar schema yang dapat diakses
 // pada database target.
-func ListSchemas(ctx context.Context, db *sql.DB) ([]Schema, error) {
+func ListSchemas(ctx context.Context, db *sql.DB) (schemas []Schema, retErr error) {
 	if db == nil {
 		return nil, fmt.Errorf("database connection is nil")
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	const query = `
 		SELECT schema_name
 		FROM information_schema.schemata
 		WHERE schema_name NOT IN (
@@ -192,13 +236,18 @@ func ListSchemas(ctx context.Context, db *sql.DB) ([]Schema, error) {
 		AND schema_name NOT LIKE 'pg_toast%%'
 		AND schema_name NOT LIKE 'pg_temp_%%'
 		ORDER BY schema_name
-	`)
+	`
+	started := startAuditQuery(ctx, query, nil)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, wrapQueryError("list schemas", err)
+		retErr = wrapQueryError("list schemas", err)
+		auditQuery(ctx, query, nil, started, 0, retErr)
+		return nil, retErr
 	}
 	defer rows.Close()
+	defer func() { auditQuery(ctx, query, nil, started, len(schemas), retErr) }()
 
-	schemas := make([]Schema, 0)
+	schemas = make([]Schema, 0)
 
 	for rows.Next() {
 		var schema Schema
@@ -216,7 +265,7 @@ func ListSchemas(ctx context.Context, db *sql.DB) ([]Schema, error) {
 }
 
 // ListConstraints mengambil constraint dari tabel tertentu.
-func ListConstraints(ctx context.Context, db *sql.DB, schema string, table string) ([]Constraint, error) {
+func ListConstraints(ctx context.Context, db *sql.DB, schema string, table string) (constraints []Constraint, retErr error) {
 	if db == nil {
 		return nil, fmt.Errorf("database connection is nil")
 	}
@@ -249,13 +298,17 @@ func ListConstraints(ctx context.Context, db *sql.DB, schema string, table strin
         ORDER BY c.conname
     `
 
+	started := startAuditQuery(ctx, query, []any{schema, table})
 	rows, err := db.QueryContext(ctx, query, schema, table)
 	if err != nil {
-		return nil, wrapQueryError("list table constraints", err)
+		retErr = wrapQueryError("list table constraints", err)
+		auditQuery(ctx, query, []any{schema, table}, started, 0, retErr)
+		return nil, retErr
 	}
 	defer rows.Close()
+	defer func() { auditQuery(ctx, query, []any{schema, table}, started, len(constraints), retErr) }()
 
-	constraints := make([]Constraint, 0)
+	constraints = make([]Constraint, 0)
 
 	for rows.Next() {
 		var c Constraint
@@ -273,7 +326,7 @@ func ListConstraints(ctx context.Context, db *sql.DB, schema string, table strin
 }
 
 // ListIndexes mengambil index dari tabel tertentu.
-func ListIndexes(ctx context.Context, db *sql.DB, schema string, table string) ([]Index, error) {
+func ListIndexes(ctx context.Context, db *sql.DB, schema string, table string) (indexes []Index, retErr error) {
 	if db == nil {
 		return nil, fmt.Errorf("database connection is nil")
 	}
@@ -284,7 +337,7 @@ func ListIndexes(ctx context.Context, db *sql.DB, schema string, table string) (
 		return nil, err
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	const query = `
 		SELECT
 			idx.relname,
 			pg_get_indexdef(i.indexrelid),
@@ -300,13 +353,18 @@ func ListIndexes(ctx context.Context, db *sql.DB, schema string, table string) (
 		WHERE ns.nspname = $1
 			AND tbl.relname = $2
 		ORDER BY idx.relname
-	`, schema, table)
+	`
+	started := startAuditQuery(ctx, query, []any{schema, table})
+	rows, err := db.QueryContext(ctx, query, schema, table)
 	if err != nil {
-		return nil, wrapQueryError("list indexes", err)
+		retErr = wrapQueryError("list indexes", err)
+		auditQuery(ctx, query, []any{schema, table}, started, 0, retErr)
+		return nil, retErr
 	}
 	defer rows.Close()
+	defer func() { auditQuery(ctx, query, []any{schema, table}, started, len(indexes), retErr) }()
 
-	indexes := make([]Index, 0)
+	indexes = make([]Index, 0)
 
 	for rows.Next() {
 		var idx Index
@@ -329,7 +387,7 @@ func ListIndexes(ctx context.Context, db *sql.DB, schema string, table string) (
 }
 
 // ReadTableData membaca isi tabel dengan pagination. Page dimulai dari 1.
-func ReadTableData(ctx context.Context, db *sql.DB, schema string, table string, page int, pageSize int) (TableData, error) {
+func ReadTableData(ctx context.Context, db *sql.DB, schema string, table string, page int, pageSize int) (result TableData, retErr error) {
 	if db == nil {
 		return TableData{}, fmt.Errorf("database connection is nil")
 	}
@@ -358,7 +416,7 @@ func ReadTableData(ctx context.Context, db *sql.DB, schema string, table string,
 		return TableData{}, fmt.Errorf("%w: %q.%q", ErrTableNotFound, schema, table)
 	}
 
-	result := TableData{
+	result = TableData{
 		Columns:  make([]string, 0, len(metadata)),
 		Rows:     make([][]any, 0),
 		Page:     page,
@@ -382,8 +440,15 @@ func ReadTableData(ctx context.Context, db *sql.DB, schema string, table string,
 
 	// Menghitung total baris untuk informasi pagination.
 	countQuery := "SELECT COUNT(*) FROM " + qualifiedTable
-	if err := tx.QueryRowContext(ctx, countQuery).Scan(&result.TotalRows); err != nil {
-		return TableData{}, wrapQueryError("count table rows", err)
+	countStarted := startAuditQuery(ctx, countQuery, nil)
+	countErr := tx.QueryRowContext(ctx, countQuery).Scan(&result.TotalRows)
+	countRows := 0
+	if countErr == nil {
+		countRows = 1
+	}
+	auditQuery(ctx, countQuery, nil, countStarted, countRows, countErr)
+	if countErr != nil {
+		return TableData{}, wrapQueryError("count table rows", countErr)
 	}
 	pages := 1
 	if result.TotalRows > 0 {
@@ -419,11 +484,15 @@ func ReadTableData(ctx context.Context, db *sql.DB, schema string, table string,
 	offset := (page - 1) * pageSize
 	query += " LIMIT $1 OFFSET $2"
 
+	queryStarted := startAuditQuery(ctx, query, []any{pageSize, offset})
 	rows, err := tx.QueryContext(ctx, query, pageSize, offset)
 	if err != nil {
-		return TableData{}, wrapQueryError("read table data", err)
+		wrapped := wrapQueryError("read table data", err)
+		auditQuery(ctx, query, []any{pageSize, offset}, queryStarted, 0, wrapped)
+		return TableData{}, wrapped
 	}
 	defer rows.Close()
+	defer func() { auditQuery(ctx, query, []any{pageSize, offset}, queryStarted, len(result.Rows), retErr) }()
 
 	for rows.Next() {
 		values := make([]any, len(result.Columns))
@@ -453,7 +522,7 @@ func quoteIdentifier(name string) string {
 }
 
 // Menggunakan katalog PostgreSQL untuk mendapatkan kolom primary key, termasuk jika primary key terdiri dari beberapa kolom.
-func primaryKeyColumns(ctx context.Context, tx *sql.Tx, schema string, table string) ([]string, error) {
+func primaryKeyColumns(ctx context.Context, tx *sql.Tx, schema string, table string) (columns []string, retErr error) {
 	const query = `
         SELECT a.attname
         FROM pg_catalog.pg_index i
@@ -473,13 +542,17 @@ func primaryKeyColumns(ctx context.Context, tx *sql.Tx, schema string, table str
         ORDER BY k.ord
     `
 
+	started := startAuditQuery(ctx, query, []any{schema, table})
 	rows, err := tx.QueryContext(ctx, query, schema, table)
 	if err != nil {
-		return nil, wrapQueryError("find primary key columns", err)
+		retErr = wrapQueryError("find primary key columns", err)
+		auditQuery(ctx, query, []any{schema, table}, started, 0, retErr)
+		return nil, retErr
 	}
 	defer rows.Close()
+	defer func() { auditQuery(ctx, query, []any{schema, table}, started, len(columns), retErr) }()
 
-	columns := make([]string, 0)
+	columns = make([]string, 0)
 
 	for rows.Next() {
 		var column string

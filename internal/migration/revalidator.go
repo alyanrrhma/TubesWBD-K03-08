@@ -87,10 +87,38 @@ func (v *Revalidator) Revalidate(ctx context.Context, j worker.Job) error {
 	}
 
 	var ready bool
-	err = v.Platform.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_review_groups WHERE revision_id=$1)
-		AND NOT EXISTS(SELECT 1 FROM migration_review_groups rg LEFT JOIN migration_approvals a
-		 ON a.revision_id=rg.revision_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='approved'
-		 WHERE rg.revision_id=$1 AND a.id IS NULL)`, revisionID).Scan(&ready)
+	if j.Operation == worker.Apply {
+		if j.OperationReviewID != 0 {
+			return worker.ErrUnapproved
+		}
+		err = v.Platform.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_review_groups WHERE revision_id=$1)
+			AND NOT EXISTS(SELECT 1 FROM migration_review_groups rg LEFT JOIN migration_approvals a
+			 ON a.revision_id=rg.revision_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='approved'
+			 WHERE rg.revision_id=$1 AND a.id IS NULL)
+			AND (SELECT COUNT(*) FROM group_database_access WHERE database_id=$2)=(SELECT COUNT(*) FROM migration_review_groups WHERE revision_id=$1)
+			AND NOT EXISTS(SELECT 1 FROM group_database_access ga JOIN app_groups g ON g.id=ga.group_id
+			 LEFT JOIN migration_review_groups rg ON rg.revision_id=$1 AND rg.group_id=ga.group_id
+			 WHERE ga.database_id=$2 AND (rg.group_id IS NULL OR rg.leader_user_id IS DISTINCT FROM g.leader_user_id OR rg.access_level IS DISTINCT FROM ga.access_level
+			 OR NOT EXISTS(SELECT 1 FROM user_groups ug WHERE ug.group_id=g.id AND ug.user_id=g.leader_user_id)))`, revisionID, databaseID).Scan(&ready)
+	} else {
+		if j.OperationReviewID <= 0 {
+			return worker.ErrUnapproved
+		}
+		err = v.Platform.QueryRowContext(ctx, `SELECT r.operation=$2 AND r.migration_id=$3 AND r.revision=$4
+			AND r.database_id=$5 AND r.source_execution_id=$6 AND r.up_sql=$7 AND r.down_sql=$8
+			AND r.workflow_status IN ('approved','queued')
+			AND EXISTS(SELECT 1 FROM migration_operation_review_groups WHERE review_id=r.id)
+			AND NOT EXISTS(SELECT 1 FROM migration_operation_review_groups rg LEFT JOIN migration_operation_approvals a
+			 ON a.review_id=rg.review_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='approved'
+			 WHERE rg.review_id=r.id AND a.id IS NULL)
+			AND NOT EXISTS(SELECT 1 FROM migration_operation_approvals a WHERE a.review_id=r.id AND a.decision='rejected')
+			AND (SELECT COUNT(*) FROM group_database_access WHERE database_id=r.database_id)=(SELECT COUNT(*) FROM migration_operation_review_groups WHERE review_id=r.id)
+			AND NOT EXISTS(SELECT 1 FROM group_database_access ga JOIN app_groups g ON g.id=ga.group_id
+			 LEFT JOIN migration_operation_review_groups rg ON rg.review_id=r.id AND rg.group_id=ga.group_id
+			 WHERE ga.database_id=r.database_id AND (rg.group_id IS NULL OR rg.leader_user_id IS DISTINCT FROM g.leader_user_id OR rg.access_level IS DISTINCT FROM ga.access_level
+			 OR NOT EXISTS(SELECT 1 FROM user_groups ug WHERE ug.group_id=g.id AND ug.user_id=g.leader_user_id)))
+			FROM migration_operation_reviews r WHERE r.id=$1`, j.OperationReviewID, j.Operation, j.MigrationID, j.Revision, j.DatabaseID, j.SourceExecutionID, upSQL, downSQL).Scan(&ready)
+	}
 	if err != nil {
 		return fmt.Errorf("revalidate approvals: %w", err)
 	}
@@ -104,8 +132,8 @@ func (v *Revalidator) Revalidate(ctx context.Context, j worker.Job) error {
 		if executedAt.Valid {
 			return ErrMigrationAlreadyExecuted
 		}
-		err = v.Platform.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_worker_history WHERE migration_id=$1)
-			OR EXISTS(SELECT 1 FROM migration_jobs WHERE migration_id=$1 AND status='success')`, definitionID).Scan(&exists)
+		err = v.Platform.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_worker_history WHERE migration_id=$1 AND database_id=$2)
+			OR EXISTS(SELECT 1 FROM migration_jobs WHERE migration_id=$1 AND database_id=$2 AND status='success')`, definitionID, databaseID).Scan(&exists)
 		if err != nil {
 			return fmt.Errorf("check prior execution: %w", err)
 		}
@@ -116,7 +144,7 @@ func (v *Revalidator) Revalidate(ctx context.Context, j worker.Job) error {
 		// already be active. History is append-only, so derive state per definition.
 		err = v.Platform.QueryRowContext(ctx, `WITH latest AS (
 			SELECT DISTINCT ON (h.migration_id) h.migration_id,h.operation
-			FROM migration_worker_history h JOIN migration_definitions d ON d.id=h.migration_id
+			FROM migration_worker_history h JOIN migration_definitions d ON d.id=h.migration_id AND d.database_id=h.database_id
 			WHERE d.database_id=$1 ORDER BY h.migration_id,h.committed_at DESC,h.execution_id DESC)
 			SELECT EXISTS(SELECT 1 FROM migration_definitions d WHERE d.database_id=$1 AND d.id<$2
 				AND NOT EXISTS(SELECT 1 FROM latest l WHERE l.migration_id=d.id AND l.operation IN ('apply','forward')))
@@ -138,7 +166,7 @@ func (v *Revalidator) Revalidate(ctx context.Context, j worker.Job) error {
 		var active bool
 		err = v.Platform.QueryRowContext(ctx, `WITH latest AS (
 			SELECT DISTINCT ON (h.migration_id) h.migration_id,h.execution_id,h.operation,h.revision
-			FROM migration_worker_history h JOIN migration_definitions d ON d.id=h.migration_id
+			FROM migration_worker_history h JOIN migration_definitions d ON d.id=h.migration_id AND d.database_id=h.database_id
 			WHERE d.database_id=$1 ORDER BY h.migration_id,h.committed_at DESC,h.execution_id DESC)
 			SELECT EXISTS(SELECT 1 FROM latest l WHERE l.migration_id=$2 AND l.execution_id=$3 AND l.revision=$4 AND l.operation IN ('apply','forward'))
 			AND NOT EXISTS(SELECT 1 FROM migration_definitions earlier WHERE earlier.database_id=$1 AND earlier.id<$2
@@ -158,11 +186,11 @@ func (v *Revalidator) Revalidate(ctx context.Context, j worker.Job) error {
 		var eligible bool
 		err = v.Platform.QueryRowContext(ctx, `WITH latest AS (
 			SELECT DISTINCT ON (h.migration_id) h.migration_id,h.execution_id,h.operation,h.revision,h.source_execution_id
-			FROM migration_worker_history h JOIN migration_definitions d ON d.id=h.migration_id
+			FROM migration_worker_history h JOIN migration_definitions d ON d.id=h.migration_id AND d.database_id=h.database_id
 			WHERE d.database_id=$1 ORDER BY h.migration_id,h.committed_at DESC,h.execution_id DESC)
 			SELECT EXISTS(SELECT 1 FROM latest l WHERE l.migration_id=$2 AND l.execution_id=$3 AND l.revision=$4 AND l.operation='rollback'
 				AND EXISTS(SELECT 1 FROM migration_worker_history applied WHERE applied.execution_id=l.source_execution_id
-					AND applied.migration_id=$2 AND applied.revision=$4 AND applied.operation IN ('apply','forward')))
+					AND applied.migration_id=$2 AND applied.database_id=$1 AND applied.revision=$4 AND applied.operation IN ('apply','forward')))
 			AND NOT EXISTS(SELECT 1 FROM migration_definitions earlier WHERE earlier.database_id=$1 AND earlier.id<$2
 				AND NOT EXISTS(SELECT 1 FROM latest l WHERE l.migration_id=earlier.id AND l.operation IN ('apply','forward')))
 			AND NOT EXISTS(SELECT 1 FROM latest l JOIN migration_definitions d ON d.id=l.migration_id
@@ -185,8 +213,8 @@ func (v *Revalidator) Revalidate(ctx context.Context, j worker.Job) error {
 		return ErrDatabaseExecutionBlocked
 	}
 
-	err = v.Platform.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_jobs WHERE migration_id=$1 AND revision=$2
-		AND id<>$3 AND status IN ('pending','running','retrying','partial','partially_reverted','uncertain'))`, definitionID, j.Revision, j.ID).Scan(&exists)
+	err = v.Platform.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_jobs WHERE migration_id=$1 AND database_id=$2 AND revision=$3
+		AND id<>$4 AND status IN ('pending','running','retrying','partial','partially_reverted','uncertain'))`, definitionID, databaseID, j.Revision, j.ID).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("check duplicate job: %w", err)
 	}

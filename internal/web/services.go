@@ -126,5 +126,12 @@ type MigrationWorkflow interface {
 	GetGroupLeader(context.Context, int64) (migration.GroupLeader, error)
 	SetGroupLeader(context.Context, int64, int64) error
 	GetJobStatus(context.Context, int64, string) (migration.JobStatus, error)
+	ResumeJob(context.Context, int64, string) (migration.JobStatus, error)
 	ExecutionOperations(context.Context, int64, int64) (migration.MigrationOperations, error)
+	ListExecutionHistory(context.Context, int64, int64, int, int, bool) ([]migration.ExecutionAttempt, int, error)
+	StartOperationReview(context.Context, int64, int64, worker.Operation) (migration.OperationReview, error)
+	GetOperationReview(context.Context, int64, int64) (migration.OperationReview, error)
+	GetLatestOperationReview(context.Context, int64, int64, worker.Operation) (migration.OperationReview, error)
+	DecideOperationReview(context.Context, int64, int64, int64, string) (migration.OperationReview, error)
+	SubmitOperationReview(context.Context, int64, int64) (worker.Job, error)
 }

@@ -201,6 +201,48 @@ func TestWorkerPGBatchAndReverseOrderRollback(t *testing.T) {
 	}
 }
 
+func TestWorkerPGPartialCompensationResumesFromReverseCheckpoint(t *testing.T) {
+	f := workerPGSetup(t)
+	gate := f.table + "_gate"
+	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY, processed boolean NOT NULL DEFAULT false);
+		INSERT INTO "` + f.table + `"(id) SELECT generate_series(1,12);
+		CREATE TABLE "` + gate + `"(fail boolean NOT NULL);
+		INSERT INTO "` + gate + `" VALUES (true)`); err != nil {
+		t.Fatal(err)
+	}
+	up := `UPDATE "` + f.table + `" SET processed=true WHERE id=ANY($1::bigint[])`
+	down := `UPDATE "` + f.table + `" SET processed=CASE WHEN id<=5 AND EXISTS(SELECT 1 FROM "` + gate + `" WHERE fail) THEN (id/(id-id))=1 ELSE false END WHERE id=ANY($1::bigint[])`
+	apply := f.enqueue(t, Forward, Batch, up, down, "", 5)
+	f.runOnce(t)
+	if status, _, batches, rows := f.state(t, apply); status != Success || batches != 3 || rows != 12 {
+		t.Fatalf("source apply status=%s batches=%d rows=%d", status, batches, rows)
+	}
+	rollback := f.enqueue(t, Rollback, Batch, up, down, apply.ExecutionID, 5)
+	f.runOnce(t)
+	status, attempts, batches, rows := f.state(t, rollback)
+	if status != PartiallyReverted || attempts != 1 || batches != 2 || rows != 7 {
+		t.Fatalf("partial compensation status=%s attempts=%d batches=%d rows=%d", status, attempts, batches, rows)
+	}
+	var processed int
+	if err := f.target.QueryRow(`SELECT count(*) FROM "` + f.table + `" WHERE processed`).Scan(&processed); err != nil || processed != 5 {
+		t.Fatalf("first compensation changed unexpected rows: processed=%d err=%v", processed, err)
+	}
+	if _, err := f.target.Exec(`DELETE FROM "` + gate + `"`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.platform.Exec(`UPDATE migration_jobs SET status='retrying',max_attempts=8,available_at=NOW(),finished_at=NULL WHERE id=$1 AND status='partially_reverted'`, rollback.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.runOnce(t)
+	status, attempts, batches, rows = f.state(t, rollback)
+	if status != Success || attempts != 2 || batches != 3 || rows != 12 {
+		t.Fatalf("resumed compensation status=%s attempts=%d batches=%d rows=%d", status, attempts, batches, rows)
+	}
+	if err := f.target.QueryRow(`SELECT count(*) FROM "` + f.table + `" WHERE processed`).Scan(&processed); err != nil || processed != 0 {
+		t.Fatalf("compensation resume left changed rows: processed=%d err=%v", processed, err)
+	}
+}
+
 func TestWorkerPGStaleClaimProofRecovery(t *testing.T) {
 	f := workerPGSetup(t)
 	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY, processed boolean NOT NULL DEFAULT false); INSERT INTO "` + f.table + `"(id) SELECT generate_series(1,7)`); err != nil {
@@ -262,6 +304,11 @@ func TestWorkerPGPartialCommitAndFailedAttemptAudit(t *testing.T) {
 	status, attempts, batches, rows := f.state(t, j)
 	if status != Partial || attempts != 1 || batches != 1 || rows != 5 {
 		t.Fatalf("partial status=%s attempts=%d batches=%d rows=%d", status, attempts, batches, rows)
+	}
+	f.runOnce(t) // Permanent SQL failure must not auto-retry a partial execution.
+	statusAfter, attemptsAfter, _, _ := f.state(t, j)
+	if statusAfter != Partial || attemptsAfter != attempts {
+		t.Fatalf("partial job retried automatically: status=%s attempts=%d", statusAfter, attemptsAfter)
 	}
 	var processed int
 	if err := f.target.QueryRow(`SELECT COUNT(*) FROM "` + f.table + `" WHERE processed`).Scan(&processed); err != nil {

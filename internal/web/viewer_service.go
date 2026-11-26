@@ -26,7 +26,7 @@ type ConnectionSource interface {
 	GetConnection(ctx context.Context, id int64) (*admin.Connection, error)
 }
 
-// TargetRegistry dipenuhi *database.Registry 
+// TargetRegistry dipenuhi *database.Registry
 type TargetRegistry interface {
 	Get(databaseID int64) (*sql.DB, error)
 }
@@ -92,6 +92,7 @@ func (v DatabaseViewer) target(ctx context.Context, userID, databaseID int64) (*
 }
 
 func (v DatabaseViewer) Schemas(ctx context.Context, userID, databaseID int64) ([]string, error) {
+	ctx = database.WithQueryAuditContext(ctx, userID, databaseID)
 	db, err := v.target(ctx, userID, databaseID)
 	if err != nil {
 		return nil, err
@@ -108,6 +109,7 @@ func (v DatabaseViewer) Schemas(ctx context.Context, userID, databaseID int64) (
 }
 
 func (v DatabaseViewer) Tables(ctx context.Context, userID, databaseID int64, schema string) ([]database.Table, error) {
+	ctx = database.WithQueryAuditContext(ctx, userID, databaseID)
 	db, err := v.target(ctx, userID, databaseID)
 	if err != nil {
 		return nil, err
@@ -116,6 +118,7 @@ func (v DatabaseViewer) Tables(ctx context.Context, userID, databaseID int64, sc
 }
 
 func (v DatabaseViewer) TableDetail(ctx context.Context, userID, databaseID int64, schema, table string) (*TableDetailView, error) {
+	ctx = database.WithQueryAuditContext(ctx, userID, databaseID)
 	db, err := v.target(ctx, userID, databaseID)
 	if err != nil {
 		return nil, err
@@ -139,6 +142,7 @@ func (v DatabaseViewer) TableDetail(ctx context.Context, userID, databaseID int6
 }
 
 func (v DatabaseViewer) TableData(ctx context.Context, userID, databaseID int64, schema, table string, page, pageSize int) (*TableDataView, error) {
+	ctx = database.WithQueryAuditContext(ctx, userID, databaseID)
 	db, err := v.target(ctx, userID, databaseID)
 	if err != nil {
 		return nil, err

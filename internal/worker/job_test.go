@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"context"
 	"errors"
+	"github.com/jackc/pgx/v5/pgconn"
 	"testing"
 	"time"
 )
@@ -35,5 +37,17 @@ func TestFailClosed(t *testing.T) {
 	w := Worker{}
 	if w.check() == nil {
 		t.Fatal("worker must not run without domain validator")
+	}
+}
+
+func TestTransientRetryClassification(t *testing.T) {
+	if !isTransient(context.DeadlineExceeded) {
+		t.Fatal("deadline timeout should be retryable")
+	}
+	if isTransient(ErrInvalidJob) || isTransient(ErrUnapproved) || isTransient(errors.New("syntax error")) {
+		t.Fatal("permanent errors must not be retried")
+	}
+	if !isTransient(&pgconn.PgError{Code: "40001"}) || isTransient(&pgconn.PgError{Code: "42601"}) {
+		t.Fatal("SQLSTATE retry classification is incorrect")
 	}
 }

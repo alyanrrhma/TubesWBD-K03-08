@@ -21,6 +21,10 @@ type migrationRequest struct {
 type approvalRequest struct {
 	GroupID int64 `json:"group_id"`
 }
+type operationApprovalRequest struct {
+	GroupID  int64  `json:"group_id"`
+	Decision string `json:"decision"`
+}
 type groupLeaderRequest struct {
 	UserID int64 `json:"user_id"`
 }
@@ -116,6 +120,28 @@ func (s *Server) apiListMigrations(w http.ResponseWriter, r *http.Request) {
 		out = append(out, apiDef(d))
 	}
 	writeAPI(w, 200, map[string]any{"items": out})
+}
+
+func (s *Server) apiExecutionHistory(w http.ResponseWriter, r *http.Request) {
+	databaseID, ok := apiID(w, r, "databaseID")
+	if !ok {
+		return
+	}
+	page, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if r.URL.Query().Get("page") == "" {
+		page = 1
+	}
+	if err != nil || page < 1 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_page", "Nomor halaman tidak valid.")
+		return
+	}
+	hideRollback := r.URL.Query().Get("hide_rollback") == "true"
+	items, total, err := s.Workflow.ListExecutionHistory(r.Context(), currentUser(r).ID, databaseID, page, 20, hideRollback)
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusOK, map[string]any{"items": items, "page": page, "page_size": 20, "total": total})
 }
 func (s *Server) apiGetMigration(w http.ResponseWriter, r *http.Request) {
 	if !requireWorkflow(s, w) {
@@ -339,6 +365,90 @@ func (s *Server) apiExecutionOperations(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeAPI(w, http.StatusOK, map[string]any{"operations": operations})
+}
+
+func (s *Server) apiStartOperationReview(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	id, ok := apiID(w, r, "definitionID")
+	if !ok {
+		return
+	}
+	operation := worker.Operation(r.PathValue("operation"))
+	review, err := s.Workflow.StartOperationReview(r.Context(), currentUser(r).ID, id, operation)
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusCreated, map[string]any{"review": review})
+}
+func (s *Server) apiGetOperationReview(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	id, ok := apiID(w, r, "reviewID")
+	if !ok {
+		return
+	}
+	review, err := s.Workflow.GetOperationReview(r.Context(), currentUser(r).ID, id)
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusOK, map[string]any{"review": review})
+}
+func (s *Server) apiGetLatestOperationReview(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	id, ok := apiID(w, r, "definitionID")
+	if !ok {
+		return
+	}
+	review, err := s.Workflow.GetLatestOperationReview(r.Context(), currentUser(r).ID, id, worker.Operation(r.PathValue("operation")))
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusOK, map[string]any{"review": review})
+}
+func (s *Server) apiDecideOperationReview(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	id, ok := apiID(w, r, "reviewID")
+	if !ok {
+		return
+	}
+	var in operationApprovalRequest
+	if err := decodeAPIJSON(w, r, &in); err != nil {
+		writeAPIDecodeError(w, err, "Body approval harus berupa JSON valid.")
+		return
+	}
+	review, err := s.Workflow.DecideOperationReview(r.Context(), currentUser(r).ID, id, in.GroupID, in.Decision)
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusOK, map[string]any{"review": review})
+}
+func (s *Server) apiSubmitOperationReview(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	id, ok := apiID(w, r, "reviewID")
+	if !ok {
+		return
+	}
+	traceCtx, end := telemetry.Start(telemetry.FromHeader(r.Context(), r.Header.Get("traceparent")), "api.migration.operation_review_enqueue", map[string]any{"review_id": id})
+	job, err := s.Workflow.SubmitOperationReview(traceCtx, currentUser(r).ID, id)
+	end(err)
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusAccepted, map[string]string{"job_id": job.ID, "execution_id": job.ExecutionID, "status": string(job.Status)})
 }
 
 func (s *Server) apiSubmitJob(w http.ResponseWriter, r *http.Request) {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,14 @@ func (s *Service) Execute(ctx context.Context, userID, databaseID int64, sqlText
 		// Belum ada SQL yang dijalankan, jadi tidak dicatat sebagai riwayat.
 		return Migration{}, fmt.Errorf("%w: begin transaction: %v", database.ErrConnectFailed, err)
 	}
+	started := time.Now()
+	slog.InfoContext(opCtx, "migration_sql_started", "actor_id", userID, "database_id", databaseID, "query", sqlText, "parameters", []any{})
 	applyErr := applyInTx(opCtx, tx, sqlText)
+	if applyErr != nil {
+		slog.ErrorContext(opCtx, "migration_sql_finished", "actor_id", userID, "database_id", databaseID, "status", "failed", "query", sqlText, "duration_ms", time.Since(started).Milliseconds(), "error", applyErr, "sqlstate", migrationSQLState(applyErr))
+	} else {
+		slog.InfoContext(opCtx, "migration_sql_finished", "actor_id", userID, "database_id", databaseID, "status", "success", "query", sqlText, "duration_ms", time.Since(started).Milliseconds())
+	}
 	// Susun riwayat berdasarkan hasil transaksi target.
 	rec := Migration{
 		DatabaseID: databaseID, Version: version, SQLText: sqlText,
@@ -140,6 +148,8 @@ func (s *Service) Explain(ctx context.Context, userID, databaseID int64, sqlText
 	opCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	var plan []byte
+	started := time.Now()
+	query := "EXPLAIN (FORMAT JSON) " + sqlText
 	if analyze {
 		tx, err := target.BeginTx(opCtx, nil)
 		if err != nil {
@@ -154,12 +164,16 @@ func (s *Service) Explain(ctx context.Context, userID, databaseID int64, sqlText
 				return "", fmt.Errorf("explain analyze migration SQL: %s", describeError(err))
 			}
 		}
-		if err := tx.QueryRowContext(opCtx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+sqlText).Scan(&plan); err != nil {
+		query = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sqlText
+		if err := tx.QueryRowContext(opCtx, query).Scan(&plan); err != nil {
+			slog.ErrorContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", query, "status", "failed", "duration_ms", time.Since(started).Milliseconds(), "error", err, "sqlstate", migrationSQLState(err))
 			return "", fmt.Errorf("explain analyze migration SQL: %s", describeError(err))
 		}
-	} else if err := target.QueryRowContext(opCtx, "EXPLAIN (FORMAT JSON) "+sqlText).Scan(&plan); err != nil {
+	} else if err := target.QueryRowContext(opCtx, query).Scan(&plan); err != nil {
+		slog.ErrorContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", query, "status", "failed", "duration_ms", time.Since(started).Milliseconds(), "error", err, "sqlstate", migrationSQLState(err))
 		return "", fmt.Errorf("explain migration SQL: %s", describeError(err))
 	}
+	slog.InfoContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", query, "status", "success", "duration_ms", time.Since(started).Milliseconds())
 	var pretty bytes.Buffer
 	if err := json.Indent(&pretty, plan, "", "  "); err != nil {
 		return string(plan), nil
@@ -181,10 +195,26 @@ func applyInTx(ctx context.Context, tx *sql.Tx, sqlText string) error {
 		}
 	}
 	if _, err := tx.ExecContext(ctx, sqlText); err != nil {
-		tx.Rollback()
+		rollbackErr := tx.Rollback()
+		slog.InfoContext(ctx, "migration_rollback_finished", "status", "rolled_back", "error", rollbackErr)
 		return err
 	}
-	return tx.Commit()
+	slog.InfoContext(ctx, "migration_commit_started")
+	err := tx.Commit()
+	if err != nil {
+		slog.ErrorContext(ctx, "migration_commit_finished", "status", "failed", "error", err, "sqlstate", migrationSQLState(err))
+		return err
+	}
+	slog.InfoContext(ctx, "migration_commit_finished", "status", "committed")
+	return nil
+}
+
+func migrationSQLState(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
 }
 
 func (s *Service) lockFor(databaseID int64) *sync.Mutex {

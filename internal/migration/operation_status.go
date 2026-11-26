@@ -49,7 +49,7 @@ func (s *WorkflowService) ExecutionOperations(ctx context.Context, userID, defin
 	err = s.Repo.DB.QueryRowContext(ctx, `SELECT h.operation,h.execution_id,h.revision,COALESCE(h.source_execution_id,''),r.irreversible,COALESCE(r.down_sql,'')
 		FROM migration_worker_history h
 		JOIN migration_revisions r ON r.definition_id=h.migration_id AND r.revision=h.revision
-		WHERE h.migration_id=$1 ORDER BY h.committed_at DESC,h.execution_id DESC LIMIT 1`, definitionID).
+		WHERE h.migration_id=$1 AND h.database_id=$2 ORDER BY h.committed_at DESC,h.execution_id DESC LIMIT 1`, definitionID, definition.DatabaseID).
 		Scan(&out.LastOperation, &out.LastExecutionID, &out.Revision, &sourceExecutionID, &irreversible, &downSQL)
 	if errors.Is(err, sql.ErrNoRows) {
 		hasHistory = false
@@ -60,9 +60,9 @@ func (s *WorkflowService) ExecutionOperations(ctx context.Context, userID, defin
 	}
 
 	var activeJob ActiveMigrationJob
-	err = s.Repo.DB.QueryRowContext(ctx, `SELECT id,execution_id,operation,status FROM migration_jobs WHERE migration_id=$1
+	err = s.Repo.DB.QueryRowContext(ctx, `SELECT id,execution_id,operation,status FROM migration_jobs WHERE migration_id=$1 AND database_id=$2
 		AND status IN ('pending','running','retrying','partial','partially_reverted','uncertain')
-		ORDER BY created_at DESC,id DESC LIMIT 1`, definitionID).Scan(&activeJob.JobID, &activeJob.ExecutionID, &activeJob.Operation, &activeJob.Status)
+		ORDER BY created_at DESC,id DESC LIMIT 1`, definitionID, definition.DatabaseID).Scan(&activeJob.JobID, &activeJob.ExecutionID, &activeJob.Operation, &activeJob.Status)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil
 	} else if err != nil {
@@ -76,14 +76,14 @@ func (s *WorkflowService) ExecutionOperations(ctx context.Context, userID, defin
 		AND status IN ('running','partial','partially_reverted','uncertain'))`, definition.DatabaseID).Scan(&databaseBlocked); err != nil {
 		return out, fmt.Errorf("check database execution state: %w", err)
 	}
-	if err = s.Repo.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_jobs WHERE migration_id=$1 AND status='success')`, definitionID).Scan(&successfulJob); err != nil {
+	if err = s.Repo.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_jobs WHERE migration_id=$1 AND database_id=$2 AND status='success')`, definitionID, definition.DatabaseID).Scan(&successfulJob); err != nil {
 		return out, fmt.Errorf("check prior successful jobs: %w", err)
 	}
 
 	var earlierInactive, laterActive bool
 	if err = s.Repo.DB.QueryRowContext(ctx, `WITH latest AS (
 		SELECT DISTINCT ON (h.migration_id) h.migration_id,h.operation
-		FROM migration_worker_history h JOIN migration_definitions d ON d.id=h.migration_id
+		FROM migration_worker_history h JOIN migration_definitions d ON d.id=h.migration_id AND d.database_id=h.database_id
 		WHERE d.database_id=$1 ORDER BY h.migration_id,h.committed_at DESC,h.execution_id DESC)
 		SELECT EXISTS(SELECT 1 FROM migration_definitions d WHERE d.database_id=$1 AND d.id<$2
 			AND NOT EXISTS(SELECT 1 FROM latest l WHERE l.migration_id=d.id AND l.operation IN ('apply','forward'))),
@@ -131,8 +131,8 @@ func (s *WorkflowService) ExecutionOperations(ctx context.Context, userID, defin
 		if hasHistory && out.LastOperation == "rollback" && sourceExecutionID != "" {
 			var sourceExists bool
 			err = s.Repo.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_worker_history
-				WHERE execution_id=$1 AND migration_id=$2 AND revision=$3 AND operation IN ('apply','forward'))`,
-				sourceExecutionID, definitionID, out.Revision).Scan(&sourceExists)
+				WHERE execution_id=$1 AND migration_id=$2 AND database_id=$3 AND revision=$4 AND operation IN ('apply','forward'))`,
+				sourceExecutionID, definitionID, definition.DatabaseID, out.Revision).Scan(&sourceExists)
 			if err != nil {
 				return out, fmt.Errorf("validate forward source execution: %w", err)
 			}

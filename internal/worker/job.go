@@ -55,6 +55,7 @@ var (
 // The same invariant applies to ReverseSQL; irreversible migrations cannot be rolled back.
 type Job struct {
 	ID, ExecutionID                                             string
+	OperationReviewID                                           int64
 	DatabaseID, MigrationID, Revision, ActorID                  int64
 	Operation                                                   Operation
 	Mode                                                        Mode
@@ -63,6 +64,7 @@ type Job struct {
 	Status                                                      Status
 	Attempt                                                     int
 	BatchesDone, RowsDone                                       int64
+	QueueWaitMS                                                 int64
 }
 
 var identifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z_0-9]{0,62}$`)
@@ -102,6 +104,24 @@ func newID() (string, error) {
 // Enqueue is the API-facing queue publisher. Domain validation MUST occur before
 // Enqueue; the worker independently repeats it using Validator.
 func Enqueue(ctx context.Context, db *sql.DB, j Job) (Job, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return Job{}, fmt.Errorf("begin enqueue: %w", err)
+	}
+	defer tx.Rollback()
+	queued, err := EnqueueTx(ctx, tx, j)
+	if err != nil {
+		return Job{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return Job{}, fmt.Errorf("commit enqueue: %w", err)
+	}
+	return queued, nil
+}
+
+// EnqueueTx writes a job in the caller's transaction so review state and queue
+// publication can become visible atomically.
+func EnqueueTx(ctx context.Context, tx *sql.Tx, j Job) (Job, error) {
 	if err := j.Validate(); err != nil {
 		return Job{}, err
 	}
@@ -125,16 +145,22 @@ func Enqueue(ctx context.Context, db *sql.DB, j Job) (Job, error) {
 	if j.Traceparent == "" {
 		j.Traceparent = telemetry.Traceparent(ctx)
 	}
-	_, err := db.ExecContext(ctx, `INSERT INTO migration_jobs
- (id,execution_id,database_id,migration_id,revision,actor_id,operation,mode,sql_text,reverse_sql,batch_table,batch_size,source_execution_id,traceparent,max_attempts)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+	_, err := tx.ExecContext(ctx, `INSERT INTO migration_jobs
+ (id,execution_id,database_id,migration_id,revision,actor_id,operation,mode,sql_text,reverse_sql,batch_table,batch_size,source_execution_id,traceparent,max_attempts,operation_review_id)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		j.ID, j.ExecutionID, j.DatabaseID, j.MigrationID, j.Revision, j.ActorID, j.Operation, j.Mode, j.SQL,
-		nullable(j.ReverseSQL), nullable(j.BatchTable), nullableInt(j.BatchSize), nullable(j.SourceExecutionID), j.Traceparent, j.MaxAttempts)
+		nullable(j.ReverseSQL), nullable(j.BatchTable), nullableInt(j.BatchSize), nullable(j.SourceExecutionID), j.Traceparent, j.MaxAttempts, nullableInt64(j.OperationReviewID))
 	if err != nil {
 		return Job{}, fmt.Errorf("enqueue: %w", err)
 	}
 	j.Status = Pending
 	return j, nil
+}
+func nullableInt64(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 func nullable(v string) any {
 	if v == "" {
