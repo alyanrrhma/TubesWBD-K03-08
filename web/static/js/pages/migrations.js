@@ -2,6 +2,7 @@ import { request } from "../api/client.js";
 import { escapeHTML } from "../router.js";
 import { loading } from "../components/layout.js";
 import { renderMigrationWorkflow } from "./migration-workflow.js";
+import { filterExecutionHistory } from "./execution-history.js";
 
 export async function migrationsPage(root, shell, user, { id }) {
   root.innerHTML = shell(user, "Migration", loading);
@@ -9,16 +10,17 @@ export async function migrationsPage(root, shell, user, { id }) {
 
   async function draw() {
     const page = Math.max(1, Number(new URLSearchParams(location.search).get("page")) || 1);
+    const hideRollback = localStorage.getItem("dbmp:hide-rollback") === "true";
     const [databaseResult, history] = await Promise.all([
       request(`/api/databases/${id}`),
-      request(`/api/databases/${id}/migration-history?page=${page}`),
+      request(`/api/databases/${id}/execution-history?page=${page}&hide_rollback=${hideRollback}`),
     ]);
     const db = databaseResult.database;
     const canEdit = db.level === "VIEW_EDIT";
     const currentPage = history.page ?? page;
     const pageSize = history.page_size ?? 20;
     const totalPages = Math.max(1, Math.ceil((history.total ?? 0) / pageSize));
-    const items = history.items || [];
+    const items = filterExecutionHistory(history.items || [], hideRollback);
 
     root.innerHTML = shell(user, `Migration – ${db.name}`, `
       <nav class="crumbs" aria-label="Lokasi"><a href="/dashboard" data-link>Database</a> / <a href="/databases/${id}" data-link>${escapeHTML(db.name)}</a> / <span>Migration</span></nav>
@@ -57,29 +59,48 @@ export async function migrationsPage(root, shell, user, { id }) {
         </section>` : `
         <div class="notice"><strong>Akses View Only.</strong> Anda dapat melihat riwayat migration, tetapi tidak dapat menjalankannya. Minta Platform Admin untuk akses View + Edit bila diperlukan.</div>`}
       <section>
-        <h2>Riwayat</h2>
+        <header class="pagehead"><h2>Riwayat seluruh attempt</h2>
+          <label class="check"><input id="hide-rollback" type="checkbox" ${hideRollback ? "checked" : ""}> Hide rollback</label>
+        </header>
         ${items.length ? `<div class="scroll"><table>
-          <thead><tr><th>Versi</th><th>Status</th><th>Dijalankan oleh</th><th>Waktu</th><th>Detail</th></tr></thead>
-          <tbody>${items.map(m => {
-            const version = m.Version ?? m.version;
-            const status = m.Status ?? m.status;
+          <thead><tr><th>Migration / revision</th><th>Operasi</th><th>Attempt</th><th>Status</th><th>Actor</th><th>Waktu</th><th>Detail</th></tr></thead>
+          <tbody>${items.map((m, index) => {
+            const status = String(m.status || "unknown").toLowerCase();
+            const succeeded = status === "success";
+            const detailID = `execution-detail-${index}`;
             return `<tr>
-              <td class="mono">${version ? `<a data-link href="/databases/${id}/migrations/${version}">v${version}</a>` : "-"}</td>
-              <td><span class="status ${status === "SUCCESS" ? "status-ok" : "status-fail"}">${status === "SUCCESS" ? "Berhasil" : "Gagal, di-rollback"}</span></td>
-              <td>${escapeHTML(m.ExecutedBy ?? m.executed_by ?? "")}</td>
-              <td>${escapeHTML(formatTime(m.ExecutedAt ?? m.executed_at))}</td>
-              <td>${version ? `<a data-link href="/databases/${id}/migrations/${version}">Lihat detail SQL</a>` : "-"}</td>
+              <td class="mono">${m.legacy ? `M1 v${m.revision}` : `M${m.migration_id} r${m.revision}`}<br><small>${escapeHTML(m.execution_id || "legacy")}</small></td>
+              <td>${escapeHTML(m.operation)}</td>
+              <td>${m.legacy ? "-" : Number(m.attempt)}</td>
+              <td><span class="status ${succeeded ? "status-ok" : "status-fail"}">${escapeHTML(status)}</span></td>
+              <td>${escapeHTML(m.actor || "")}</td>
+              <td>${escapeHTML(formatTime(m.started_at))}</td>
+              <td><button class="btn btn-secondary" type="button" data-history-detail="${detailID}">SQL / error</button></td>
             </tr>`;
-          }).join("")}</tbody>
+          }).map((row, index) => `${row}<tr id="execution-detail-${index}" hidden><td colspan="7"><pre class="sqlblock"></pre></td></tr>`).join("")}</tbody>
         </table></div>` : `<div class="empty"><p>Belum ada migration pada database ini.</p></div>`}
         ${totalPages > 1 ? `<nav class="pager" aria-label="Halaman riwayat migration">
-          ${currentPage > 1 ? `<a data-link href="/databases/${id}/migrations?page=${currentPage - 1}">Migration lebih baru</a>` : `<span class="muted">Migration lebih baru</span>`}
+          ${currentPage > 1 ? `<a data-link href="/databases/${id}/migrations?page=${currentPage - 1}">Riwayat lebih baru</a>` : `<span class="muted">Riwayat lebih baru</span>`}
           <span>Halaman ${currentPage} dari ${totalPages}</span>
-          ${currentPage < totalPages ? `<a data-link href="/databases/${id}/migrations?page=${currentPage + 1}">Migration lebih lama</a>` : `<span class="muted">Migration lebih lama</span>`}
+          ${currentPage < totalPages ? `<a data-link href="/databases/${id}/migrations?page=${currentPage + 1}">Riwayat lebih lama</a>` : `<span class="muted">Riwayat lebih lama</span>`}
         </nav>` : ""}
       </section>`);
 
     await renderMigrationWorkflow(root, id, user, canEdit);
+    root.querySelector("#hide-rollback")?.addEventListener("change", (event) => {
+      localStorage.setItem("dbmp:hide-rollback", String(event.currentTarget.checked));
+      draw();
+    });
+    items.forEach((item, index) => {
+      const button = root.querySelector(`[data-history-detail="execution-detail-${index}"]`);
+      button?.addEventListener("click", () => {
+        const row = root.querySelector(`#execution-detail-${index}`);
+        const pre = row?.querySelector("pre");
+        if (!row || !pre) return;
+        row.hidden = !row.hidden;
+        pre.textContent = [item.sql_started ? "SQL dikirim ke PostgreSQL" : "SQL belum dijalankan (gagal sebelum eksekusi)", item.sql, item.error ? `Error: ${item.error}` : "", item.sqlstate ? `SQLSTATE: ${item.sqlstate}` : "", item.job_id ? `Job: ${item.job_id}` : "", item.source_execution_id ? `Source execution: ${item.source_execution_id}` : ""].filter(Boolean).join("\n\n");
+      });
+    });
     if (!canEdit) return;
 
     const sqlInput = root.querySelector("#migration-sql");

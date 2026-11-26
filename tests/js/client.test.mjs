@@ -5,6 +5,8 @@ import { test } from "node:test";
 const clientPath = new URL("../../web/static/js/api/client.js", import.meta.url);
 const source = await readFile(clientPath, "utf8");
 const client = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`);
+const historySource = await readFile(new URL("../../web/static/js/pages/execution-history.js", import.meta.url), "utf8");
+const history = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(historySource)}`);
 
 function response(status, payload, contentType = "application/json") {
   return {
@@ -92,4 +94,21 @@ test("keeps credentials and CSRF headers for mutations", async () => {
   assert.equal(requestOptions.credentials, "same-origin");
   assert.equal(requestOptions.headers.get("X-CSRF-Token"), "csrf-test-token");
   client.setCSRF("");
+});
+
+test("hide rollback filters successful execution pairs by execution ID only", () => {
+  const rows = [
+    { execution_id: "E1", migration_id: 1, operation: "apply", status: "success" },
+    { execution_id: "E2", migration_id: 2, operation: "apply", status: "success" },
+    { execution_id: "E2-failed-retry", migration_id: 2, operation: "apply", status: "failed" },
+    { execution_id: "E3", migration_id: 2, operation: "rollback", source_execution_id: "E2", status: "success" },
+    { execution_id: "E4", migration_id: 2, operation: "forward", source_execution_id: "E3", status: "success" },
+    { execution_id: "E5", migration_id: 3, operation: "apply", status: "success" },
+    { execution_id: "E6", migration_id: 4, operation: "rollback", source_execution_id: "E5", status: "failed" },
+    { execution_id: "E7", migration_id: 5, operation: "rollback", source_execution_id: "missing", status: "success" },
+  ];
+  assert.deepEqual(history.filterExecutionHistory(rows, false), rows);
+  assert.deepEqual(history.filterExecutionHistory(rows, true).map((row) => row.execution_id), [
+    "E1", "E2-failed-retry", "E4", "E5", "E6",
+  ]);
 });

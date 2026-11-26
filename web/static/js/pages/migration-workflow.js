@@ -55,7 +55,7 @@ export async function renderMigrationWorkflow(root, databaseID, user, canEdit) {
   let pollGeneration = 0;
   const pollInterval = 2000;
   const maxPolls = 300;
-  const terminalJobStates = new Set(["success", "failed", "uncertain"]);
+  const terminalJobStates = new Set(["success", "failed", "uncertain", "partial", "partially_reverted"]);
 
   function persistJob(job) {
     try {
@@ -112,8 +112,8 @@ export async function renderMigrationWorkflow(root, databaseID, user, canEdit) {
     const label = normalized === "success" ? "Berhasil"
       : normalized === "failed" ? "Gagal"
         : normalized === "uncertain" ? "Tidak pasti — perlu rekonsiliasi"
-          : normalized === "partial" ? "Sebagian selesai — worker akan mencoba kembali"
-            : normalized === "partially_reverted" ? "Rollback sebagian — worker akan mencoba kembali"
+          : normalized === "partial" ? "Sebagian selesai — perlu dilanjutkan manual"
+            : normalized === "partially_reverted" ? "Rollback sebagian — perlu dilanjutkan manual"
               : normalized === "running" ? "Sedang berjalan"
                 : normalized === "retrying" ? "Akan dicoba kembali"
                   : "Menunggu worker";
@@ -129,10 +129,26 @@ export async function renderMigrationWorkflow(root, databaseID, user, canEdit) {
       ${job.pollError ? `<p class="flash-error" role="alert">Gagal membaca status job: ${escapeHTML(job.pollError)}</p>` : ""}
       ${job.storageError ? `<p class="flash-error" role="alert">ID job tidak dapat disimpan untuk dibuka kembali: ${escapeHTML(job.storageError)}</p>` : ""}
       ${!terminal && job.pollStopped ? `<p role="status">Polling berhenti setelah batas waktu UI. Status akhir belum diketahui.</p><button class="btn btn-secondary" type="button" data-resume-job-poll>Lanjutkan pemantauan</button>` : ""}
+      ${canEdit && partial && job.can_resume !== false ? `<button class="btn btn-secondary" type="button" data-resume-execution>Lanjutkan dari checkpoint</button>` : ""}
       ${normalized === "uncertain" ? `<p>Jangan menganggap operasi berhasil atau mengirim ulang sebelum kondisi database direkonsiliasi.</p>` : ""}`;
     region.dataset.terminal = String(terminal);
     const resume = region.querySelector("[data-resume-job-poll]");
     if (resume) resume.addEventListener("click", () => startPolling(activeJob, detail));
+    const resumeExecution = region.querySelector("[data-resume-execution]");
+    if (resumeExecution) resumeExecution.addEventListener("click", async () => {
+      resumeExecution.disabled = true;
+      try {
+        const result = await request(`/api/jobs/${encodeURIComponent(job.job_id)}/resume`, { method: "POST", body: {} });
+        activeJob.latest = result.job;
+        activeJob.status = result.job.status;
+        activeJob.pollStopped = false;
+        persistJob(activeJob);
+        await loadList("Job dilanjutkan dari checkpoint terakhir yang committed.");
+      } catch (error) {
+        resumeExecution.disabled = false;
+        region.insertAdjacentHTML("beforeend", `<p class="flash flash-error" role="alert">${escapeHTML(error.message)}</p>`);
+      }
+    });
   }
 
   function startPolling(job, detail) {
@@ -312,6 +328,14 @@ export async function renderMigrationWorkflow(root, databaseID, user, canEdit) {
       const operationsResult = canEdit ? await request(`/api/migrations/${definitionID}/operations`) : null;
       if (requestID !== detailRequestID) return;
       const operations = operationsResult?.operations;
+      const operationReviews = {};
+      for (const operation of ["rollback", "forward"]) {
+        try {
+          operationReviews[operation] = (await request(`/api/migrations/${definitionID}/operations/${operation}/review`)).review;
+        } catch (error) {
+          if (error.status !== 404) throw error;
+        }
+      }
       if (operations?.active_job) {
         const sameJob = activeJob?.job_id === operations.active_job.job_id;
         stopPolling();
@@ -380,9 +404,26 @@ export async function renderMigrationWorkflow(root, databaseID, user, canEdit) {
               ${canEnqueueApply ? `<button class="btn" type="button" data-enqueue-operation="apply">Antrekan eksekusi yang disetujui</button>` : ""}
               ${!ready && review.status === "APPROVED" ? `<p class="notice">Eksekusi belum siap. Readiness backend harus menyatakan revision disetujui dan seluruh syarat valid.</p>` : ""}
               ${ready && !operations?.apply?.available && operations?.apply?.reason ? `<p class="notice">Apply belum tersedia: ${escapeHTML(operations.apply.reason)}</p>` : ""}
-              ${canEnqueueRollback ? `<button class="btn btn-secondary" type="button" data-enqueue-operation="rollback">Antrekan rollback</button>` : operations?.rollback?.reason ? `<p class="muted">Rollback belum tersedia: ${escapeHTML(operations.rollback.reason)}</p>` : ""}
-              ${canEnqueueForward ? `<button class="btn btn-secondary" type="button" data-enqueue-operation="forward">Antrekan forward</button>` : operations?.forward?.reason ? `<p class="muted">Forward belum tersedia: ${escapeHTML(operations.forward.reason)}</p>` : ""}
+              ${canEnqueueRollback ? `<button class="btn btn-secondary" type="button" data-enqueue-operation="rollback">Minta persetujuan rollback</button>` : operations?.rollback?.reason ? `<p class="muted">Rollback belum tersedia: ${escapeHTML(operations.rollback.reason)}</p>` : ""}
+              ${canEnqueueForward ? `<button class="btn btn-secondary" type="button" data-enqueue-operation="forward">Minta persetujuan forward</button>` : operations?.forward?.reason ? `<p class="muted">Forward belum tersedia: ${escapeHTML(operations.forward.reason)}</p>` : ""}
             ` : ""}
+            ${["rollback", "forward"].map(operation => {
+              const opReview = operationReviews[operation];
+              if (!opReview) return "";
+              const opCanSubmit = canEdit && opReview.status === "approved" && !jobIsActive && operations?.[operation]?.available;
+              return `<section class="panel" aria-label="Persetujuan ${operation}">
+                <h4>Review ${escapeHTML(operation)} #${opReview.id}</h4>
+                <p>Status: <strong>${escapeHTML(opReview.status)}</strong>; source execution <code>${escapeHTML(opReview.source_execution_id)}</code>.</p>
+                <div class="table-wrap"><table><thead><tr><th>Group</th><th>Leader</th><th>Keputusan</th><th>Aksi</th></tr></thead><tbody>
+                  ${(opReview.groups || []).map(group => {
+                    const mayDecide = opReview.status === "in_review" && Number(group.leader_user_id) === currentUserID && group.decision === "pending";
+                    return `<tr><td>${escapeHTML(group.group_name)}</td><td>User ID ${group.leader_user_id}</td><td>${escapeHTML(group.decision)}</td>
+                      <td>${mayDecide ? `<button class="btn" type="button" data-op-review-decision="approved" data-review-id="${opReview.id}" data-group-id="${group.group_id}">Setujui</button> <button class="btn-danger" type="button" data-op-review-decision="rejected" data-review-id="${opReview.id}" data-group-id="${group.group_id}">Tolak</button>` : "-"}</td></tr>`;
+                  }).join("")}
+                </tbody></table></div>
+                ${opCanSubmit ? `<button class="btn" type="button" data-op-review-submit="${opReview.id}">Antrekan ${escapeHTML(operation)} yang disetujui</button>` : ""}
+              </section>`;
+            }).join("")}
             <div data-job-status ${activeJob && String(activeJob.migrationID) === String(definitionID) ? `data-job-id="${escapeHTML(activeJob.job_id)}"` : ""}></div>
           </section>
           <details>
@@ -456,6 +497,31 @@ export async function renderMigrationWorkflow(root, databaseID, user, canEdit) {
         }
       }));
 
+      detail.querySelectorAll("[data-op-review-decision]").forEach(button => button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await request(`/api/operation-reviews/${button.dataset.reviewId}/approvals`, { method: "POST", body: {
+            group_id: Number(button.dataset.groupId), decision: button.dataset.opReviewDecision,
+          } });
+          await openWorkflow(definitionID, "Keputusan review operasi tercatat.");
+        } catch (error) {
+          button.disabled = false;
+          detail.querySelector("[data-migration-detail]").insertAdjacentHTML("afterbegin", `<p class="flash flash-error" role="alert">${escapeHTML(error.message)}</p>`);
+        }
+      }));
+      detail.querySelectorAll("[data-op-review-submit]").forEach(button => button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const result = await request(`/api/operation-reviews/${button.dataset.opReviewSubmit}/submit`, { method: "POST", body: {} });
+          activeJob = { job_id: result.job_id, execution_id: result.execution_id, migrationID: definitionID, status: result.status || "pending" };
+          persistJob(activeJob);
+          await loadList("Job operasi yang disetujui diterima antrean.");
+        } catch (error) {
+          button.disabled = false;
+          detail.querySelector("[data-migration-detail]").insertAdjacentHTML("afterbegin", `<p class="flash flash-error" role="alert">${escapeHTML(error.message)}</p>`);
+        }
+      }));
+
       if (activeJob && String(activeJob.migrationID) === String(definitionID)) {
         activeJob.latest = activeJob.latest || { status: activeJob.status };
         renderJobStatus(detail, { ...activeJob, ...activeJob.latest, pollStopped: activeJob.pollStopped }, activeJob.latest.status);
@@ -480,6 +546,12 @@ export async function renderMigrationWorkflow(root, databaseID, user, canEdit) {
         };
         let accepted = false;
         try {
+          if (operation !== "apply") {
+            await request(`/api/migrations/${definitionID}/operations/${operation}/review`, { method: "POST", body: {} });
+            accepted = true;
+            await openWorkflow(definitionID, `Review ${operation} dibuat. Leader seluruh group akses harus menyetujui sebelum job dapat diantrekan.`);
+            return;
+          }
           const result = await request(endpoints[operation], { method: "POST", body: {} });
           accepted = true;
           if (!result.job_id || !result.execution_id) throw new Error("Respons antrean tidak menyertakan job ID dan execution ID.");
