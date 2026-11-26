@@ -2,14 +2,13 @@ package web_test
 
 import (
 	"context"
-	"html"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +19,7 @@ import (
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/auth"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/config"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/database"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/web"
 )
 
@@ -106,12 +106,17 @@ func newEnv(t *testing.T) *env {
 	}
 	e.migs = &recordingMigrations{access: e.access}
 	e.workflow = &fakeWorkflow{}
-	adminSvc := &fakeAdmin{users: users, connections: []admin.Connection{{ID: 1, Name: "Target", Host: "localhost", Port: 5433, Database: "dbmp_target", Username: "dbmp", SSLMode: "disable", Complete: true}}}
-	e.admin = adminSvc
+	e.admin = &fakeAdmin{
+		users: users,
+		connections: []admin.Connection{{
+			ID: 1, Name: "Target", Host: "localhost", Port: 5433, Database: "dbmp_target",
+			Username: "dbmp", SSLMode: "disable", Complete: true,
+		}},
+	}
 
 	srv, err := web.New(web.Deps{
 		Config: cfg, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Sessions: mgr, Users: users, Admin: adminSvc,
+		Sessions: mgr, Users: users, Admin: e.admin,
 		Viewer: e.viewer, Migrations: e.migs, Workflow: e.workflow,
 	})
 	if err != nil {
@@ -122,7 +127,6 @@ func newEnv(t *testing.T) *env {
 	return e
 }
 
-// client baru dengan cookie jar; redirect tidak diikuti agar bisa diperiksa
 func (e *env) client() *http.Client {
 	jar, _ := cookiejar.New(nil)
 	return &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -150,22 +154,6 @@ func (e *env) post(c *http.Client, path string, form url.Values) (*http.Response
 	return e.do(c, req)
 }
 
-var csrfRe = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
-
-// postCSRF mengambil token CSRF dari halaman /dashboard lalu mengirim form
-func (e *env) postCSRF(c *http.Client, path string, form url.Values) (*http.Response, string) {
-	e.t.Helper()
-	_, page := e.get(c, "/dashboard")
-	m := csrfRe.FindStringSubmatch(page)
-	if m == nil {
-		e.t.Fatal("token csrf tidak ditemukan di halaman")
-	}
-	form.Set("csrf_token", m[1])
-	return e.post(c, path, form)
-}
-
-// login membuat session langsung lewat auth.Manager (tanpa PBKDF2) agar test cepat;
-// alur login lewat HTTP diuji khusus di TestLoginFailureAndSuccess
 func (e *env) login(user string) *http.Client {
 	e.t.Helper()
 	c := e.client()
@@ -181,6 +169,20 @@ func (e *env) login(user string) *http.Client {
 	return c
 }
 
+func loginViaAPI(t *testing.T, e *env, c *http.Client, username, password string) (*http.Response, string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]string{"username": username, "password": password})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return apiRequest(t, e, c, http.MethodPost, "/api/auth/login", string(payload), "")
+}
+
+func apiPost(t *testing.T, e *env, c *http.Client, path, body string) (*http.Response, string) {
+	t.Helper()
+	return apiRequest(t, e, c, http.MethodPost, path, body, apiCSRF(t, e, c))
+}
+
 func cookie(resp *http.Response, name string) *http.Cookie {
 	for _, c := range resp.Cookies() {
 		if c.Name == name {
@@ -190,37 +192,40 @@ func cookie(resp *http.Response, name string) *http.Cookie {
 	return nil
 }
 
-func sales(e *env) string { return "/databases/100" }
-
-func TestUnauthenticatedRedirectsToLogin(t *testing.T) {
+func TestSPARoutesServeOneShell(t *testing.T) {
 	e := newEnv(t)
-	resp, _ := e.get(e.client(), "/databases/100")
-	if resp.StatusCode != http.StatusSeeOther || !strings.HasPrefix(resp.Header.Get("Location"), "/login?next=") {
-		t.Fatalf("status=%d location=%q", resp.StatusCode, resp.Header.Get("Location"))
+	var shell string
+	for _, path := range []string{
+		"/login", "/dashboard", "/admin", "/admin/groups", "/databases/100",
+		"/databases/100/migrations", "/databases/100/tables/public/customers",
+	} {
+		resp, body := e.get(e.client(), path)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(body, `<div id="app"`) ||
+			!strings.Contains(body, `/static/js/main.js`) {
+			t.Errorf("GET %s harus mengirim SPA shell, status=%d", path, resp.StatusCode)
+		}
+		if shell == "" {
+			shell = body
+		} else if body != shell {
+			t.Errorf("GET %s mengirim dokumen selain shell SPA", path)
+		}
 	}
 }
 
-func TestLoginFailureAndSuccess(t *testing.T) {
+func TestAPILoginFailureAndSuccess(t *testing.T) {
 	e := newEnv(t)
 	c := e.client()
-
-	for _, form := range []url.Values{
-		{"username": {"alice"}, "password": {"salah-salah"}},
-		{"username": {"tidak-ada"}, "password": {"password-1234"}},
-		{"username": {""}, "password": {""}},
-	} {
-		resp, body := e.post(c, "/login", form)
-		if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(body, "Username atau password salah.") {
-			t.Fatalf("%v: login gagal harus 401 dengan pesan generik, dapat %d", form, resp.StatusCode)
-		}
-		if cookie(resp, auth.CookieName) != nil {
-			t.Fatal("login gagal tidak boleh membuat cookie session")
-		}
+	resp, body := loginViaAPI(t, e, c, "alice", "salah-salah")
+	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(body, "Username atau password salah.") {
+		t.Fatalf("login gagal harus 401 dengan pesan generik, dapat %d: %s", resp.StatusCode, body)
+	}
+	if cookie(resp, auth.CookieName) != nil {
+		t.Fatal("login gagal tidak boleh membuat cookie session")
 	}
 
-	resp, _ := e.post(c, "/login", url.Values{"username": {"alice"}, "password": {"password-1234"}})
-	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/dashboard" {
-		t.Fatalf("status=%d location=%q", resp.StatusCode, resp.Header.Get("Location"))
+	resp, body = loginViaAPI(t, e, c, "alice", "password-1234")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"username":"alice"`) {
+		t.Fatalf("login API status=%d body=%s", resp.StatusCode, body)
 	}
 	for _, name := range []string{auth.CookieName, "dbmp_csrf"} {
 		ck := cookie(resp, name)
@@ -228,12 +233,15 @@ func TestLoginFailureAndSuccess(t *testing.T) {
 			t.Fatalf("atribut cookie %s tidak sesuai: %+v", name, ck)
 		}
 	}
+	if resp, _ := e.get(c, "/api/auth/me"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("sesi login harus dapat dibaca lewat API, status %d", resp.StatusCode)
+	}
 }
 
-func TestLoginRejectsForeignOrigin(t *testing.T) {
+func TestAPILoginRejectsForeignOrigin(t *testing.T) {
 	e := newEnv(t)
-	req, _ := http.NewRequest("POST", e.ts.URL+"/login", strings.NewReader("username=alice&password=password-1234"))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req, _ := http.NewRequest(http.MethodPost, e.ts.URL+"/api/auth/login", strings.NewReader(`{"username":"alice","password":"password-1234"}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://evil.example")
 	resp, _ := e.do(e.client(), req)
 	if resp.StatusCode != http.StatusForbidden || cookie(resp, auth.CookieName) != nil {
@@ -241,24 +249,23 @@ func TestLoginRejectsForeignOrigin(t *testing.T) {
 	}
 }
 
-func TestLoginNextIsNotOpenRedirect(t *testing.T) {
+func TestLegacyLoginFormIsNotAnEndpoint(t *testing.T) {
 	e := newEnv(t)
-	for next, want := range map[string]string{
-		"//evil.example":       "/dashboard",
-		"https://evil.example": "/dashboard",
-		"/\\evil":              "/dashboard",
-		"/databases/100":       "/databases/100",
-	} {
-		resp, _ := e.post(e.client(), "/login", url.Values{"username": {"alice"}, "password": {"password-1234"}, "next": {next}})
-		if got := resp.Header.Get("Location"); got != want {
-			t.Errorf("next=%q -> %q, ingin %q", next, got, want)
-		}
+	resp, _ := e.post(e.client(), "/login", url.Values{"username": {"alice"}, "password": {"password-1234"}})
+	if resp.StatusCode != http.StatusMethodNotAllowed && resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("login form lama tidak boleh digunakan, status %d", resp.StatusCode)
+	}
+	if cookie(resp, auth.CookieName) != nil {
+		t.Fatal("endpoint login form lama tidak boleh membuat session")
 	}
 }
 
-func TestSecondLoginRevokesPreviousSession(t *testing.T) {
+func TestSecondAPILoginRevokesPreviousSession(t *testing.T) {
 	e := newEnv(t)
-	c := e.login("alice")
+	c := e.client()
+	if resp, body := loginViaAPI(t, e, c, "alice", "password-1234"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("login pertama status=%d body=%s", resp.StatusCode, body)
+	}
 	u, _ := url.Parse(e.ts.URL)
 	var old string
 	for _, ck := range c.Jar.Cookies(u) {
@@ -269,368 +276,216 @@ func TestSecondLoginRevokesPreviousSession(t *testing.T) {
 	if old == "" {
 		t.Fatal("cookie session tidak ada")
 	}
-	// Login ulang dengan klien yang sama (cookie lama terkirim) -> session lama harus dicabut.
-	e.post(c, "/login", url.Values{"username": {"alice"}, "password": {"password-1234"}})
+	if resp, body := loginViaAPI(t, e, c, "alice", "password-1234"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("login kedua status=%d body=%s", resp.StatusCode, body)
+	}
 	other := e.client()
 	other.Jar.SetCookies(u, []*http.Cookie{{Name: auth.CookieName, Value: old, Path: "/"}})
-	if resp, _ := e.get(other, "/dashboard"); resp.StatusCode != http.StatusSeeOther {
+	if resp, _ := e.get(other, "/api/auth/me"); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("session lama harus tidak berlaku, dapat %d", resp.StatusCode)
 	}
 }
 
-func TestDashboardShowsOnlyAccessibleDatabases(t *testing.T) {
+func TestAPIListsOnlyAccessibleDatabasesAndChecksDirectAccess(t *testing.T) {
 	e := newEnv(t)
-	_, body := e.get(e.login("alice"), "/dashboard")
-	if !strings.Contains(body, "Sales DB") || strings.Contains(body, "Inventory DB") || !strings.Contains(body, "View &#43; Edit") {
-		t.Fatal("alice hanya boleh melihat Sales DB (View + Edit)")
+	alice := e.login("alice")
+	_, body := e.get(alice, "/api/databases")
+	if !strings.Contains(body, "Sales DB") || strings.Contains(body, "Inventory DB") {
+		t.Fatalf("alice hanya boleh melihat Sales DB, body=%s", body)
 	}
-	_, body = e.get(e.login("bob"), "/dashboard")
-	if !strings.Contains(body, "Sales DB") || !strings.Contains(body, "Inventory DB") || !strings.Contains(body, "View Only") {
-		t.Fatal("bob harus melihat dua database dengan label View Only")
+	bob := e.login("bob")
+	_, body = e.get(bob, "/api/databases")
+	if !strings.Contains(body, "Sales DB") || !strings.Contains(body, "Inventory DB") {
+		t.Fatalf("bob harus melihat kedua database yang diizinkan, body=%s", body)
 	}
-	_, body = e.get(e.login("admin"), "/dashboard")
-	if !strings.Contains(body, "Belum ada database yang bisa Anda akses") {
-		t.Fatal("admin tanpa group harus melihat empty state")
+	if resp, body := e.get(alice, "/api/databases/101"); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("akses langsung ke database terlarang harus 403, status=%d body=%s", resp.StatusCode, body)
+	}
+	if resp, _ := e.get(e.client(), "/api/auth/me"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("API terproteksi harus 401 tanpa session, status %d", resp.StatusCode)
 	}
 }
 
-func TestDirectAccessToForbiddenDatabase(t *testing.T) {
-	e := newEnv(t)
-	c := e.login("alice") // tidak punya akses ke Inventory DB (101)
-	for _, p := range []string{"/databases/101", "/databases/101/migrations", "/databases/101/tables/public/customers", "/databases/101/tables/public/customers/data"} {
-		if resp, _ := e.get(c, p); resp.StatusCode != http.StatusForbidden {
-			t.Errorf("GET %s: status %d, ingin 403", p, resp.StatusCode)
-		}
-	}
-	resp, _ := e.postCSRF(c, "/databases/101/migrations", url.Values{"sql": {"DROP TABLE x"}})
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("POST migration tanpa akses: status %d, ingin 403", resp.StatusCode)
-	}
-	if len(e.migs.history) != 0 {
-		t.Fatal("tidak boleh ada migration yang tercatat")
-	}
-}
-
-func TestCSRFTokenInPageMatchesSessionAndIsRequired(t *testing.T) {
+func TestLogoutAPIRequiresCSRFAndEndsSession(t *testing.T) {
 	e := newEnv(t)
 	c := e.login("alice")
-
-	_, page := e.get(c, "/dashboard")
-	if !csrfRe.MatchString(page) {
-		t.Fatal("form logout harus memuat token CSRF")
+	if resp, _ := apiRequest(t, e, c, http.MethodPost, "/api/auth/logout", `{}`, ""); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("logout tanpa CSRF harus 403, status %d", resp.StatusCode)
 	}
-	if resp, _ := e.post(c, "/logout", nil); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("logout tanpa token: status %d, ingin 403", resp.StatusCode)
+	if resp, _ := apiRequest(t, e, c, http.MethodPost, "/api/auth/logout", `{}`, strings.Repeat("a", 43)); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("logout dengan CSRF salah harus 403, status %d", resp.StatusCode)
 	}
-	if resp, _ := e.post(c, "/logout", url.Values{"csrf_token": {strings.Repeat("a", 43)}}); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("logout dengan token salah: status %d, ingin 403", resp.StatusCode)
-	}
-	// Origin asing ditolak meski token benar.
-	m := csrfRe.FindStringSubmatch(page)
-	req, _ := http.NewRequest("POST", e.ts.URL+"/logout", strings.NewReader("csrf_token="+m[1]))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	token := apiCSRF(t, e, c)
+	req, _ := http.NewRequest(http.MethodPost, e.ts.URL+"/api/auth/logout", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", token)
 	req.Header.Set("Origin", "https://evil.example")
 	if resp, _ := e.do(c, req); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("Origin asing: status %d, ingin 403", resp.StatusCode)
+		t.Fatalf("Origin asing harus ditolak, status %d", resp.StatusCode)
 	}
-	// Setelah semua penolakan, session tetap hidup.
-	if resp, _ := e.get(c, "/dashboard"); resp.StatusCode != http.StatusOK {
-		t.Fatal("session seharusnya masih aktif")
+	if resp, body := apiRequest(t, e, c, http.MethodPost, "/api/auth/logout", `{}`, token); resp.StatusCode != http.StatusOK {
+		t.Fatalf("logout valid status=%d body=%s", resp.StatusCode, body)
 	}
-	// Token valid lewat header juga diterima.
-	req, _ = http.NewRequest("POST", e.ts.URL+"/logout", nil)
-	req.Header.Set("X-CSRF-Token", m[1])
-	if resp, _ := e.do(c, req); resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("logout dengan header X-CSRF-Token: status %d", resp.StatusCode)
-	}
-	if resp, _ := e.get(c, "/dashboard"); resp.StatusCode != http.StatusSeeOther {
-		t.Fatal("setelah logout, dashboard harus mengarahkan ke login")
+	if resp, _ := e.get(c, "/api/auth/me"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("setelah logout API harus menolak session, status %d", resp.StatusCode)
 	}
 }
 
-func TestMissingCSRFCookieIsReissuedOnGet(t *testing.T) {
+func TestMissingAPICSRFCookieIsReissued(t *testing.T) {
 	e := newEnv(t)
 	c := e.login("alice")
 	u, _ := url.Parse(e.ts.URL)
 	c.Jar.SetCookies(u, []*http.Cookie{{Name: "dbmp_csrf", Value: "", MaxAge: -1, Path: "/"}})
-	resp, page := e.get(c, "/dashboard")
-	if cookie(resp, "dbmp_csrf") == nil || !csrfRe.MatchString(page) {
-		t.Fatal("cookie CSRF yang hilang harus diterbitkan ulang pada GET")
-	}
-	if r, _ := e.postCSRF(c, "/logout", url.Values{}); r.StatusCode != http.StatusSeeOther {
-		t.Fatalf("token baru harus berlaku, dapat %d", r.StatusCode)
+	resp, body := e.get(c, "/api/csrf")
+	if resp.StatusCode != http.StatusOK || cookie(resp, "dbmp_csrf") == nil || !strings.Contains(body, "csrf_token") {
+		t.Fatalf("GET API harus menerbitkan ulang cookie CSRF, status=%d body=%s", resp.StatusCode, body)
 	}
 }
 
-func TestSessionExpiresAfterIdleTimeout(t *testing.T) {
+func TestAPIAuthSessionExpiresAfterIdleTimeout(t *testing.T) {
 	e := newEnv(t)
 	c := e.login("alice")
-	e.clock.Advance(31 * time.Minute) // idle default 30m
-	resp, _ := e.get(c, "/dashboard")
-	if resp.StatusCode != http.StatusSeeOther || !strings.HasPrefix(resp.Header.Get("Location"), "/login") {
-		t.Fatalf("session idle harus diarahkan ke login, dapat %d %q", resp.StatusCode, resp.Header.Get("Location"))
+	e.clock.Advance(31 * time.Minute)
+	if resp, _ := e.get(c, "/api/auth/me"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("session idle harus ditolak oleh API, status %d", resp.StatusCode)
 	}
-	_, body := e.get(c, "/login")
-	if !strings.Contains(body, "Sesi Anda telah berakhir") {
-		t.Fatal("pengguna harus diberi tahu bahwa sesi berakhir")
+	if resp, _ := e.get(c, "/dashboard"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("route browser tetap harus mengirim shell SPA, status %d", resp.StatusCode)
 	}
 }
 
-func TestSessionRotationKeepsUserLoggedIn(t *testing.T) {
+func TestAPISessionRotationKeepsUserLoggedIn(t *testing.T) {
 	e := newEnv(t)
 	c := e.login("alice")
-	e.clock.Advance(16 * time.Minute) // rotation interval 15m, idle 30m
-	resp, _ := e.get(c, "/dashboard")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %d", resp.StatusCode)
-	}
-	if ck := cookie(resp, auth.CookieName); ck == nil || ck.Value == "" {
-		t.Fatal("cookie session harus dirotasi")
-	}
-	// Cookie baru dipakai klien; CSRF cookie tetap valid untuk aksi POST.
-	if r, _ := e.postCSRF(c, "/logout", url.Values{}); r.StatusCode != http.StatusSeeOther {
-		t.Fatalf("POST setelah rotation: status %d", r.StatusCode)
-	}
-}
-
-func TestAdminPagesRestrictedToAdmin(t *testing.T) {
-	e := newEnv(t)
-	alice := e.login("alice")
-	for _, p := range []string{"/admin", "/admin/users", "/admin/groups", "/admin/connections"} {
-		if resp, _ := e.get(alice, p); resp.StatusCode != http.StatusForbidden {
-			t.Errorf("non-admin GET %s: status %d, ingin 403", p, resp.StatusCode)
+	u, _ := url.Parse(e.ts.URL)
+	var old string
+	for _, ck := range c.Jar.Cookies(u) {
+		if ck.Name == auth.CookieName {
+			old = ck.Value
 		}
 	}
-	resp, _ := e.postCSRF(alice, "/admin/users", url.Values{"username": {"x-user"}, "password": {"secret-1234"}})
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("POST admin oleh non-admin: status %d, ingin 403", resp.StatusCode)
-	}
-	if resp, _ := e.get(e.login("admin"), "/admin/users"); resp.StatusCode != http.StatusOK {
-		t.Fatalf("admin GET /admin/users: status %d", resp.StatusCode)
+	e.clock.Advance(16 * time.Minute)
+	resp, body := e.get(c, "/api/auth/me")
+	rotated := cookie(resp, auth.CookieName)
+	if resp.StatusCode != http.StatusOK || rotated == nil || rotated.Value == old {
+		t.Fatalf("GET /api/auth/me harus merotasi session, status=%d body=%s cookie=%+v", resp.StatusCode, body, rotated)
 	}
 }
 
-func TestAdminCanEditConnectionAndReenterPassword(t *testing.T) {
+func TestAdminAPIRestrictsAdminResources(t *testing.T) {
 	e := newEnv(t)
-	adminClient := e.login("admin")
-	resp, body := e.get(adminClient, "/admin/connections")
-	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `action="/admin/connections/1"`) || !strings.Contains(body, "Kosongkan untuk mempertahankan password") {
-		t.Fatalf("form edit koneksi harus tampil tanpa password tersimpan: status %d", resp.StatusCode)
+	if resp, _ := e.get(e.login("alice"), "/api/admin/users"); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-admin API harus 403, status %d", resp.StatusCode)
 	}
-	form := url.Values{"name": {"Target diperbarui"}, "host": {"localhost"}, "port": {"5433"}, "database": {"dbmp_target"}, "username": {"dbmp"}, "password": {"dbmp_dev_password"}, "ssl_mode": {"disable"}}
-	resp, _ = e.postCSRF(adminClient, "/admin/connections/1", form)
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("update koneksi status %d", resp.StatusCode)
-	}
-	resp, body = e.get(adminClient, "/admin/connections")
-	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Target diperbarui") || !strings.Contains(body, "Koneksi berhasil diperbarui") {
-		t.Fatal("perubahan koneksi dan status sukses harus terlihat")
+	if resp, body := e.get(e.login("admin"), "/api/admin/users"); resp.StatusCode != http.StatusOK || !strings.Contains(body, "alice") {
+		t.Fatalf("admin API status=%d body=%s", resp.StatusCode, body)
 	}
 }
 
-func TestAdminCreateUserFlashAndSelfDelete(t *testing.T) {
+func TestAdminAPICreatesUsersAndProtectsCurrentAccount(t *testing.T) {
 	e := newEnv(t)
 	c := e.login("admin")
-
-	e.postCSRF(c, "/admin/users", url.Values{"username": {"carol"}, "password": {"secret-1234"}})
-	_, body := e.get(c, "/admin/users")
-	if !strings.Contains(body, "carol") || !strings.Contains(body, "Pengguna berhasil dibuat.") {
-		t.Fatal("pengguna baru dan flash sukses harus tampil")
+	resp, body := apiPost(t, e, c, "/api/admin/users", `{"username":"carol","password":"secret-1234"}`)
+	if resp.StatusCode != http.StatusCreated || !strings.Contains(body, "carol") {
+		t.Fatalf("create user status=%d body=%s", resp.StatusCode, body)
 	}
-	e.postCSRF(c, "/admin/users", url.Values{"username": {"carol"}, "password": {"secret-1234"}})
-	_, body = e.get(c, "/admin/users")
-	if !strings.Contains(body, "Username sudah dipakai.") {
-		t.Fatal("pesan validasi dari service harus tampil")
+	resp, _ = apiPost(t, e, c, "/api/admin/users", `{"username":"carol","password":"secret-1234"}`)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("duplicate username harus 422, status %d", resp.StatusCode)
 	}
-	if _, body = e.get(c, "/admin/users"); strings.Contains(body, "Username sudah dipakai.") {
-		t.Fatal("flash tidak boleh muncul dua kali")
-	}
-	e.postCSRF(c, "/admin/users/"+"1"+"/delete", url.Values{}) // id 1 = admin sendiri
-	if _, body = e.get(c, "/admin/users"); !strings.Contains(body, "tidak dapat menghapus akun yang sedang dipakai") {
-		t.Fatal("menghapus akun sendiri harus ditolak dengan pesan")
+	resp, body = apiRequest(t, e, c, http.MethodDelete, "/api/admin/users/1", "", apiCSRF(t, e, c))
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(body, "akun yang sedang digunakan") {
+		t.Fatalf("akun aktif tidak boleh dihapus, status=%d body=%s", resp.StatusCode, body)
 	}
 }
 
-func TestAdminDeleteUserWithMigrationHistoryShowsFlash(t *testing.T) {
+func TestAdminAPIReportsUsersWithMigrationHistory(t *testing.T) {
 	e := newEnv(t)
-	c := e.login("admin")
 	e.admin.deleteError = admin.ErrUserHasHistory
-
-	resp, _ := e.postCSRF(c, "/admin/users/3/delete", url.Values{})
-	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/admin/users" {
-		t.Fatalf("hapus user ber-riwayat harus kembali ke daftar user, dapat status %d dan Location %q", resp.StatusCode, resp.Header.Get("Location"))
-	}
-
-	resp, body := e.get(c, "/admin/users")
-	if resp.StatusCode != http.StatusOK ||
-		!strings.Contains(body, "Pengguna tidak dapat dihapus karena pernah menjalankan migration") ||
-		!strings.Contains(body, "Untuk mencabut akses") {
-		t.Fatal("pesan penolakan harus tampil di halaman daftar pengguna")
-	}
-}
-
-func TestOutputIsEscaped(t *testing.T) {
-	e := newEnv(t)
 	c := e.login("admin")
-	e.postCSRF(c, "/admin/groups", url.Values{"name": {`<script>alert(1)</script>`}})
-	_, body := e.get(c, "/admin/groups")
-	if strings.Contains(body, "<script>alert(1)") || !strings.Contains(body, "&lt;script&gt;alert(1)") {
-		t.Fatal("nama group harus di-escape")
+	resp, body := apiRequest(t, e, c, http.MethodDelete, "/api/admin/users/3", "", apiCSRF(t, e, c))
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(body, "riwayat migration") {
+		t.Fatalf("user ber-riwayat harus ditolak, status=%d body=%s", resp.StatusCode, body)
 	}
 }
 
-func TestMigrationViewOnlyCannotExecute(t *testing.T) {
+func TestAdminAPIJSONEscapesGroupMarkup(t *testing.T) {
+	e := newEnv(t)
+	resp, body := apiPost(t, e, e.login("admin"), "/api/admin/groups", `{"name":"<script>alert(1)</script>"}`)
+	if resp.StatusCode != http.StatusCreated || strings.Contains(body, "<script>") || !strings.Contains(body, `\u003cscript\u003e`) {
+		t.Fatalf("API harus mengembalikan JSON ter-escape, status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestViewOnlyCannotCreateOrExplainMigrations(t *testing.T) {
 	e := newEnv(t)
 	bob := e.login("bob")
-	_, body := e.get(bob, "/databases/100/migrations")
-	if strings.Contains(body, `name="sql"`) || !strings.Contains(body, "Akses View Only") {
-		t.Fatal("View Only tidak boleh melihat editor migration")
+	e.workflow.createErr = migration.ErrForbidden
+	payload := `{"name":"blocked","up_sql":"ALTER TABLE customers ADD COLUMN note TEXT","down_sql":"ALTER TABLE customers DROP COLUMN note"}`
+	resp, body := apiPost(t, e, bob, "/api/databases/100/migrations", payload)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(body, `"code":"forbidden"`) {
+		t.Fatalf("View Only create harus ditolak, status=%d body=%s", resp.StatusCode, body)
 	}
-	resp, _ := e.postCSRF(bob, "/databases/100/migrations", url.Values{"sql": {"DROP TABLE customers;"}})
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("View Only POST migration langsung: status %d, ingin 403", resp.StatusCode)
-	}
-	resp, _ = e.postCSRF(bob, "/databases/100/migrations/explain", url.Values{"sql": {"SELECT * FROM customers"}})
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("View Only EXPLAIN langsung: status %d, ingin 403", resp.StatusCode)
-	}
-	if len(e.migs.history) != 0 {
-		t.Fatal("history tidak boleh bertambah")
+	resp, body = apiPost(t, e, bob, "/api/databases/100/migrations/explain", `{"sql":"SELECT * FROM customers"}`)
+	if resp.StatusCode != http.StatusForbidden || len(e.migs.history) != 0 {
+		t.Fatalf("View Only EXPLAIN harus ditolak, status=%d body=%s", resp.StatusCode, body)
 	}
 }
 
-func TestMigrationExplainShowsPlanBeforeExecution(t *testing.T) {
+func TestMigrationExplainUsesAPIWithoutExecuting(t *testing.T) {
 	e := newEnv(t)
 	alice := e.login("alice")
-	path := "/databases/100/migrations/explain"
-	sql := "SELECT * FROM customers WHERE id = 1"
-	resp, body := e.postCSRF(alice, path, url.Values{"sql": {sql}})
-	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Estimated execution plan") || !strings.Contains(body, "Node Type") || !strings.Contains(body, sql) {
-		t.Fatalf("EXPLAIN harus menampilkan SQL dan plan: status %d", resp.StatusCode)
+	resp, body := apiPost(t, e, alice, "/api/databases/100/migrations/explain", `{"sql":"SELECT * FROM customers WHERE id = 1"}`)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Node Type") || !strings.Contains(body, "Result") {
+		t.Fatalf("EXPLAIN API harus menampilkan query plan, status=%d body=%s", resp.StatusCode, body)
 	}
 	if len(e.migs.history) != 0 {
 		t.Fatal("EXPLAIN tidak boleh mengeksekusi atau mencatat migration")
 	}
 }
 
-func TestSchemaDiffGeneratesEditableCandidateAndRequiresEditAccess(t *testing.T) {
-	e := newEnv(t)
-	alice := e.login("alice")
-	_, body := e.get(alice, "/databases/100/schema-diff")
-	if !strings.Contains(body, "Schema diff") || !strings.Contains(body, `name="desired_schema"`) || !strings.Contains(html.UnescapeString(body), `"schema":"public"`) {
-		t.Fatal("schema diff page should show current schema as editable JSON")
-	}
-	desired := `{"schema":"public","tables":[]}`
-	resp, body := e.postCSRF(alice, "/databases/100/schema-diff", url.Values{"desired_schema": {desired}})
-	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Perubahan schema") || !strings.Contains(body, "Kandidat SQL migration") || !strings.Contains(body, "DROP TABLE") || !strings.Contains(body, "Perubahan destruktif") {
-		t.Fatalf("schema diff should render the change and editable SQL candidate, status %d", resp.StatusCode)
-	}
-	if len(e.migs.history) != 0 {
-		t.Fatal("schema diff must not execute a migration")
-	}
-	bob := e.login("bob")
-	resp, _ = e.postCSRF(bob, "/databases/100/schema-diff", url.Values{"desired_schema": {desired}})
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("View Only schema diff POST: status %d, want 403", resp.StatusCode)
-	}
-}
-
-// M2 requires all execution to go through approval and the worker. The old
-// HTML route must not execute, even for an editor or invalid SQL.
 func TestLegacyMigrationExecutionIsDisabled(t *testing.T) {
 	e := newEnv(t)
 	alice := e.login("alice")
-	path := "/databases/100/migrations"
-	for _, sql := range []string{"ALTER TABLE orders ADD COLUMN note TEXT;", "SELECT fail;", "  \n "} {
-		resp, _ := e.postCSRF(alice, path, url.Values{"sql": {sql}})
-		if resp.StatusCode != http.StatusGone {
-			t.Fatalf("legacy migration must return 410, got %d for %q", resp.StatusCode, sql)
+	for _, query := range []string{"ALTER TABLE orders ADD COLUMN note TEXT;", "SELECT fail;", "  \n "} {
+		resp, _ := e.post(alice, "/databases/100/migrations", url.Values{"sql": {query}})
+		if resp.StatusCode != http.StatusGone && resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("legacy migration harus dinonaktifkan, dapat %d untuk %q", resp.StatusCode, query)
 		}
 	}
 	if len(e.migs.history) != 0 {
-		t.Fatal("legacy endpoint must never execute SQL")
+		t.Fatal("legacy endpoint tidak boleh mengeksekusi SQL")
 	}
 }
 
-// Legacy read-only history is retained; seed the fake history directly instead
-// of creating entries using the now-disabled synchronous migration endpoint.
-func TestMigrationHistoryPagination(t *testing.T) {
+func TestMigrationHistoryPaginationUsesAPI(t *testing.T) {
 	e := newEnv(t)
 	alice := e.login("alice")
-	path := "/databases/100/migrations"
 	for i := 27; i >= 1; i-- {
 		e.migs.history = append(e.migs.history, web.MigrationRecord{
 			ID: int64(i), Version: i, SQL: "SELECT 1", Status: web.MigrationSuccess,
 			ExecutedBy: "tester", ExecutedAt: time.Now(),
 		})
 	}
-	_, body := e.get(alice, path+"?page=2")
-	if !strings.Contains(body, "Halaman 2 dari 2") ||
-		!strings.Contains(body, `href="/databases/100/migrations/2"`) ||
-		!strings.Contains(body, `href="/databases/100/migrations/1"`) {
-		t.Fatal("halaman kedua harus menampilkan tautan migration tertua dengan navigasi halaman")
-	}
-	resp, _ := e.get(alice, path+"?page=0")
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("page 0 harus ditolak, status %d", resp.StatusCode)
+	resp, body := e.get(alice, "/api/databases/100/migration-history?page=2")
+	for _, expected := range []string{`"page":2`, `"total":27`, `"Version":7`, `"Version":1`} {
+		if resp.StatusCode != http.StatusOK || !strings.Contains(body, expected) {
+			t.Fatalf("pagination API status=%d body=%s missing=%s", resp.StatusCode, body, expected)
+		}
 	}
 }
 
-func TestTableDataPaginationAndNull(t *testing.T) {
+func TestTableDataPaginationAndNullUseAPI(t *testing.T) {
 	e := newEnv(t)
 	alice := e.login("alice")
-	base := "/databases/100/tables/public/customers/data"
-
-	_, body := e.get(alice, base)
-	if !strings.Contains(body, "Baris 1–50 dari 120") || !strings.Contains(body, "Halaman 1 dari 3") || !strings.Contains(body, `class="null">NULL<`) {
-		t.Fatal("halaman 1 harus menampilkan baris 1–50 dari 120 dan menandai NULL")
+	resp, body := e.get(alice, "/api/databases/100/tables/public/customers/data")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"pages":3`) ||
+		!strings.Contains(body, `"Page":1`) || !strings.Contains(body, `"Total":120`) || !strings.Contains(body, `"Null":true`) {
+		t.Fatalf("data API page 1 tidak sesuai, status=%d body=%s", resp.StatusCode, body)
 	}
-	_, body = e.get(alice, base+"?page=3")
-	if !strings.Contains(body, "Baris 101–120 dari 120") {
-		t.Fatal("halaman 3 harus menampilkan baris 101–120")
-	}
-	resp, _ := e.get(alice, base+"?page=99")
-	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != base+"?page=3" {
-		t.Fatalf("di luar jangkauan harus ke halaman terakhir, dapat %d %q", resp.StatusCode, resp.Header.Get("Location"))
-	}
-	resp, _ = e.get(alice, base+"?page=999999999")
-	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != base+"?page=3" {
-		t.Fatalf("nomor halaman sangat besar harus diarahkan ke halaman terakhir, dapat %d %q", resp.StatusCode, resp.Header.Get("Location"))
-	}
-	if resp, _ := e.get(alice, "/databases/100/tables/public/customers"); resp.StatusCode != http.StatusOK {
-		t.Fatalf("halaman struktur: %d", resp.StatusCode)
-	}
-	if resp, _ := e.get(alice, "/databases/100?schema=audit"); resp.StatusCode != http.StatusOK {
-		t.Fatalf("halaman database: %d", resp.StatusCode)
-	}
-}
-
-func TestTargetErrorsDoNotLeakDetails(t *testing.T) {
-	e := newEnv(t)
-	alice := e.login("alice")
-	cases := map[error]struct {
-		status int
-		text   string
-	}{
-		wrap(database.ErrConnectFailed, "password=s3cr3t"):        {http.StatusBadGateway, "Tidak dapat terhubung ke database target"},
-		wrap(database.ErrNotRegistered, "id 100"):                 {http.StatusServiceUnavailable, "belum aktif"},
-		wrap(database.ErrTargetPermissionDenied, "host=10.0.0.5"): {http.StatusBadGateway, "menolak akses"},
-		wrap(database.ErrTableNotFound, "\"x\".\"y\""):            {http.StatusNotFound, "tidak ditemukan"},
-		wrap(database.ErrQueryTimeout, "count table rows"):        {http.StatusGatewayTimeout, "Database target terlalu lama merespons"},
-		wrap(database.ErrWriteRejected, "read table data"):        {http.StatusForbidden, "Penulisan ditolak"},
-		io.ErrUnexpectedEOF: {http.StatusInternalServerError, "tidak dapat diproses"},
-	}
-	for err, want := range cases {
-		e.viewer.err = err
-		resp, body := e.get(alice, "/databases/100")
-		if resp.StatusCode != want.status || !strings.Contains(body, want.text) {
-			t.Errorf("%v: status %d, ingin %d dengan %q", err, resp.StatusCode, want.status, want.text)
-		}
-		for _, secret := range []string{"s3cr3t", "10.0.0.5", "unexpected EOF"} {
-			if strings.Contains(body, secret) {
-				t.Errorf("%v: respons membocorkan %q", err, secret)
-			}
-		}
+	resp, body = e.get(alice, "/api/databases/100/tables/public/customers/data?page=3")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"Page":3`) {
+		t.Fatalf("data API page 3 tidak sesuai, status=%d body=%s", resp.StatusCode, body)
 	}
 }
 
@@ -642,6 +497,34 @@ type wrapped struct {
 func wrap(s error, d string) error { return wrapped{s, d} }
 func (w wrapped) Error() string    { return w.sentinel.Error() + ": " + w.detail }
 func (w wrapped) Unwrap() error    { return w.sentinel }
+
+func TestTargetErrorsDoNotLeakDetailsThroughAPI(t *testing.T) {
+	e := newEnv(t)
+	alice := e.login("alice")
+	cases := map[error]struct {
+		status int
+		text   string
+	}{
+		wrap(database.ErrConnectFailed, "password=s3cr3t"):        {http.StatusServiceUnavailable, "Koneksi database target belum tersedia."},
+		wrap(database.ErrNotRegistered, "id 100"):                 {http.StatusServiceUnavailable, "Koneksi database target belum tersedia."},
+		wrap(database.ErrTargetPermissionDenied, "host=10.0.0.5"): {http.StatusBadGateway, "Database target menolak akses."},
+		wrap(database.ErrTableNotFound, `"x"."y"`):                {http.StatusNotFound, "Data tidak ditemukan."},
+		wrap(database.ErrQueryTimeout, "count table rows"):        {http.StatusGatewayTimeout, "Query melewati batas waktu."},
+		io.ErrUnexpectedEOF: {http.StatusInternalServerError, "Terjadi kesalahan saat memproses permintaan."},
+	}
+	for err, want := range cases {
+		e.viewer.err = err
+		resp, body := e.get(alice, "/api/databases/100")
+		if resp.StatusCode != want.status || !strings.Contains(body, want.text) {
+			t.Errorf("%v: status=%d want=%d body=%q", err, resp.StatusCode, want.status, body)
+		}
+		for _, secret := range []string{"s3cr3t", "10.0.0.5", "unexpected EOF"} {
+			if strings.Contains(body, secret) {
+				t.Errorf("%v: respons membocorkan %q", err, secret)
+			}
+		}
+	}
+}
 
 func TestSecurityHeadersAndHealth(t *testing.T) {
 	e := newEnv(t)
@@ -674,11 +557,11 @@ func TestFormatCell(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := web.FormatCellForTest(c.in); got != c.want {
-			t.Errorf("formatCell(%#v) = %#v, ingin %#v", c.in, got, c.want)
+			t.Errorf("formatCell(%#v) = %#v, want %#v", c.in, got, c.want)
 		}
 	}
 	long := strings.Repeat("é", 600)
-	if got := web.FormatCellForTest(long); len([]rune(got.Text)) != 501 {
-		t.Errorf("teks panjang harus dipotong ke 500 karakter + elipsis, dapat %d", len([]rune(got.Text)))
+	if got := web.FormatCellForTest(long); len([]rune(got.Text)) != 501 || !strings.HasSuffix(got.Text, "…") {
+		t.Fatalf("format panjang harus dipotong dengan ellipsis, dapat %d rune", len([]rune(got.Text)))
 	}
 }

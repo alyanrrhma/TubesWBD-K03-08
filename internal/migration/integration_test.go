@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/access"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -20,14 +22,29 @@ func openTestDB(t *testing.T, dsn string) *sql.DB {
 	if err != nil || !strings.HasSuffix(strings.TrimPrefix(u.Path, "/"), "_test") {
 		t.Fatalf("test DSN must point to a database whose name ends with _test")
 	}
-	db, err := sql.Open("pgx", dsn)
+	adminDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
-	if _, err := db.Exec("DROP SCHEMA public CASCADE; CREATE SCHEMA public"); err != nil {
+	schema := fmt.Sprintf("migration_test_%d", time.Now().UnixNano())
+	if _, err := adminDB.Exec(`CREATE SCHEMA "` + schema + `"`); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_, _ = adminDB.Exec(`DROP SCHEMA IF EXISTS "` + schema + `" CASCADE`)
+		_ = adminDB.Close()
+	})
+
+	// Each package gets a private search_path instead of resetting public, so
+	// integration tests may safely share the same *_test database.
+	query := u.Query()
+	query.Set("search_path", schema)
+	u.RawQuery = query.Encode()
+	db, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
@@ -78,7 +95,7 @@ func TestExecute_Success(t *testing.T) {
 	if err != nil || rec.Status != StatusSuccess || rec.Version != 1 {
 		t.Fatalf("rec=%+v err=%v", rec, err)
 	}
-	if !tableExists(t, target, "public.t1") {
+	if !tableExists(t, target, "t1") {
 		t.Fatal("table was not created in target")
 	}
 }
@@ -94,7 +111,7 @@ func TestExecute_FailureRollsBackEverything(t *testing.T) {
 	if rec.Status != StatusFailed || rec.ErrorMessage == "" {
 		t.Fatalf("rec=%+v", rec)
 	}
-	if tableExists(t, target, "public.a") {
+	if tableExists(t, target, "a") {
 		t.Fatal("first statement leaked despite rollback")
 	}
 }

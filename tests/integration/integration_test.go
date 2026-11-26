@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,7 +12,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -78,11 +78,13 @@ func newStack(t *testing.T) *stack {
 		t.Fatal(err)
 	}
 	migrationSvc := migration.NewService(db, registry, migration.AccessAuthorizer{Access: accessSvc})
+	workflowSvc := migration.NewWorkflowService(db, migration.AccessAuthorizer{Access: accessSvc})
 	srv, err := web.New(web.Deps{
 		Config: cfg, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Sessions: sessions, Users: auth.PostgresUsers{DB: db}, Admin: adminSvc,
 		Viewer:     web.DatabaseViewer{Access: accessSvc, Conns: adminSvc, Registry: registry},
 		Migrations: web.MigrationAdapter{Service: migrationSvc},
+		Workflow:   workflowSvc,
 		Health:     db.PingContext,
 	})
 	if err != nil {
@@ -103,16 +105,17 @@ func (s *stack) client() *http.Client {
 	return &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
-func (s *stack) do(c *http.Client, method, path string, form url.Values) (*http.Response, string) {
+func (s *stack) do(c *http.Client, method, path string) (*http.Response, string) {
 	s.t.Helper()
-	var body io.Reader
-	if form != nil {
-		body = strings.NewReader(form.Encode())
+	req, err := http.NewRequest(method, s.ts.URL+path, nil)
+	if err != nil {
+		s.t.Fatal(err)
 	}
-	req, _ := http.NewRequest(method, s.ts.URL+path, body)
-	if form != nil {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	}
+	return s.doRequest(c, req)
+}
+
+func (s *stack) doRequest(c *http.Client, req *http.Request) (*http.Response, string) {
+	s.t.Helper()
 	resp, err := c.Do(req)
 	if err != nil {
 		s.t.Fatal(err)
@@ -122,26 +125,54 @@ func (s *stack) do(c *http.Client, method, path string, form url.Values) (*http.
 	return resp, string(b)
 }
 
-var csrfRe = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
-
-func (s *stack) post(c *http.Client, path string, form url.Values) *http.Response {
+func (s *stack) api(c *http.Client, method, path string, payload any, csrf bool) (*http.Response, string) {
 	s.t.Helper()
-	_, page := s.do(c, "GET", "/dashboard", nil)
-	m := csrfRe.FindStringSubmatch(page)
-	if m == nil {
-		s.t.Fatal("token csrf tidak ditemukan")
+	var body io.Reader
+	if payload != nil {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			s.t.Fatal(err)
+		}
+		body = strings.NewReader(string(data))
 	}
-	form.Set("csrf_token", m[1])
-	resp, _ := s.do(c, "POST", path, form)
-	return resp
+	req, err := http.NewRequest(method, s.ts.URL+path, body)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if csrf {
+		req.Header.Set("X-CSRF-Token", s.csrf(c))
+	}
+	return s.doRequest(c, req)
+}
+
+func (s *stack) csrf(c *http.Client) string {
+	s.t.Helper()
+	resp, body := s.api(c, http.MethodGet, "/api/csrf", nil, false)
+	if resp.StatusCode != http.StatusOK {
+		s.t.Fatalf("csrf API status=%d body=%s", resp.StatusCode, body)
+	}
+	var result struct {
+		Data struct {
+			Token string `json:"csrf_token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &result); err != nil || result.Data.Token == "" {
+		s.t.Fatalf("token CSRF API tidak valid: %s (%v)", body, err)
+	}
+	return result.Data.Token
 }
 
 func (s *stack) login(user string) *http.Client {
 	s.t.Helper()
 	c := s.client()
-	resp, _ := s.do(c, "POST", "/login", url.Values{"username": {user}, "password": {"password-1234"}})
-	if resp.StatusCode != http.StatusSeeOther {
-		s.t.Fatalf("login %s gagal: %d", user, resp.StatusCode)
+	resp, body := s.api(c, http.MethodPost, "/api/auth/login", map[string]string{
+		"username": user, "password": "password-1234",
+	}, false)
+	if resp.StatusCode != http.StatusOK {
+		s.t.Fatalf("login API %s gagal: %d %s", user, resp.StatusCode, body)
 	}
 	return c
 }
@@ -155,186 +186,226 @@ func (s *stack) user(name string, isAdmin bool) {
 	s.t.Cleanup(func() { s.db.Exec(`DELETE FROM users WHERE id=$1`, u.ID) })
 }
 
-func TestEndToEndAdminToViewer(t *testing.T) {
+func groupID(t *testing.T, s *stack, name string) int64 {
+	t.Helper()
+	var id int64
+	if err := s.db.QueryRowContext(s.ctx, `SELECT id FROM app_groups WHERE name=$1`, name).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func userID(t *testing.T, s *stack, name string) int64 {
+	t.Helper()
+	var id int64
+	if err := s.db.QueryRowContext(s.ctx, `SELECT id FROM users WHERE username=$1`, name).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestEndToEndSPAMigrationReviewAndViewerAccess(t *testing.T) {
 	s := newStack(t)
-	adminName, viewer, editor := "it-admin-"+s.suffix, "it-view-"+s.suffix, "it-edit-"+s.suffix
+	adminName, viewer, editor, noAccess := "it-admin-"+s.suffix, "it-view-"+s.suffix, "it-edit-"+s.suffix, "it-none-"+s.suffix
 	s.user(adminName, true)
 	s.user(viewer, false)
 	s.user(editor, false)
+	s.user(noAccess, false)
 
-	// Data contoh di database target.
 	schema := "it_" + s.suffix
-	for _, q := range []string{
+	for _, query := range []string{
 		`CREATE SCHEMA ` + schema,
 		`CREATE TABLE ` + schema + `.items (id integer primary key, nama text not null, catatan text)`,
 		`INSERT INTO ` + schema + `.items SELECT g, 'item ' || g, CASE WHEN g % 2 = 0 THEN NULL ELSE '<b>x</b>' END FROM generate_series(1, 75) g`,
 	} {
-		if _, err := s.target.ExecContext(s.ctx, q); err != nil {
+		if _, err := s.target.ExecContext(s.ctx, query); err != nil {
 			t.Fatal(err)
 		}
 	}
 	t.Cleanup(func() { s.target.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`) })
 
-	// --- Admin mendaftarkan koneksi, group, anggota, dan akses lewat HTTP.
 	adm := s.login(adminName)
-	tu, _ := url.Parse(s.targetDSN)
-	pw, _ := tu.User.Password()
-	connName := "it-conn-" + s.suffix
-	resp := s.post(adm, "/admin/connections", url.Values{
-		"name": {connName}, "host": {tu.Hostname()}, "port": {tu.Port()},
-		"database": {strings.TrimPrefix(tu.Path, "/")}, "username": {tu.User.Username()}, "password": {pw}, "ssl_mode": {"disable"},
-	})
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("tambah koneksi: %d", resp.StatusCode)
-	}
-	var connID int64
-	if err := s.db.QueryRowContext(s.ctx, `SELECT id FROM database_connections WHERE name=$1`, connName).Scan(&connID); err != nil {
-		t.Fatalf("koneksi tidak tersimpan: %v", err)
-	}
-	t.Cleanup(func() { s.db.Exec(`DELETE FROM database_connections WHERE id=$1`, connID) })
-
-	groupName := "it-group-" + s.suffix
-	s.post(adm, "/admin/groups", url.Values{"name": {groupName}})
-	var groupID int64
-	if err := s.db.QueryRowContext(s.ctx, `SELECT id FROM app_groups WHERE name=$1`, groupName).Scan(&groupID); err != nil {
+	tu, err := url.Parse(s.targetDSN)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.db.Exec(`DELETE FROM app_groups WHERE id=$1`, groupID) })
-
-	uid := func(name string) string {
-		var id int64
-		s.db.QueryRowContext(s.ctx, `SELECT id FROM users WHERE username=$1`, name).Scan(&id)
-		return strconv.FormatInt(id, 10)
+	port, _ := strconv.Atoi(tu.Port())
+	if port == 0 {
+		port = 5432
 	}
-	g := "/admin/groups/" + strconv.FormatInt(groupID, 10)
-	s.post(adm, g+"/members", url.Values{"user_id": {uid(viewer)}})
-	s.post(adm, g+"/access", url.Values{"database_id": {strconv.FormatInt(connID, 10)}, "level": {"VIEW_ONLY"}})
-	if _, body := s.do(adm, "GET", g, nil); !strings.Contains(body, viewer) || !strings.Contains(body, connName) {
-		t.Fatal("halaman group harus menampilkan anggota dan akses")
+	password, _ := tu.User.Password()
+	connection := map[string]any{
+		"name": "it-conn-" + s.suffix, "host": tu.Hostname(), "port": port,
+		"database": strings.TrimPrefix(tu.Path, "/"), "username": tu.User.Username(),
+		"password": password, "ssl_mode": "disable",
 	}
-	if _, body := s.do(adm, "GET", "/admin/connections", nil); !strings.Contains(body, connName) || !strings.Contains(body, "Aktif") {
-		t.Fatal("koneksi harus tampil dan aktif")
+	resp, body := s.api(adm, http.MethodPost, "/api/admin/connections", connection, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create connection status=%d body=%s", resp.StatusCode, body)
+	}
+	connectionName := connection["name"].(string)
+	var connectionID int64
+	if err := s.db.QueryRowContext(s.ctx, `SELECT id FROM database_connections WHERE name=$1`, connectionName).Scan(&connectionID); err != nil {
+		t.Fatalf("koneksi tidak tersimpan: %v", err)
+	}
+	t.Cleanup(func() { s.db.Exec(`DELETE FROM database_connections WHERE id=$1`, connectionID) })
+
+	primaryGroup, secondGroup := "it-group-"+s.suffix, "it-edit-group-"+s.suffix
+	resp, body = s.api(adm, http.MethodPost, "/api/admin/groups", map[string]string{"name": primaryGroup}, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create group %s: status=%d body=%s", primaryGroup, resp.StatusCode, body)
+	}
+	primaryID := groupID(t, s, primaryGroup)
+	t.Cleanup(func() { s.db.Exec(`DELETE FROM app_groups WHERE id=$1`, primaryID) })
+
+	memberPath := fmt.Sprintf("/api/admin/groups/%d/members", primaryID)
+	resp, body = s.api(adm, http.MethodPost, memberPath, map[string]int64{"user_id": userID(t, s, viewer)}, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("add primary group member: status=%d body=%s", resp.StatusCode, body)
+	}
+	accessPath := fmt.Sprintf("/api/admin/groups/%d/access", primaryID)
+	resp, body = s.api(adm, http.MethodPost, accessPath, map[string]any{"database_id": connectionID, "level": "VIEW_ONLY"}, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("grant View Only access: status=%d body=%s", resp.StatusCode, body)
+	}
+	leaderPath := fmt.Sprintf("/api/admin/groups/%d/leader", primaryID)
+	resp, body = s.api(adm, http.MethodPut, leaderPath, map[string]int64{"user_id": userID(t, s, viewer)}, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set primary group leader: status=%d body=%s", resp.StatusCode, body)
 	}
 
-	db := "/databases/" + strconv.FormatInt(connID, 10)
+	// All browser routes serve the shared SPA shell; data and authorization stay in the API.
+	for _, path := range []string{"/login", "/dashboard", "/admin/groups", "/databases/" + strconv.FormatInt(connectionID, 10)} {
+		resp, shell := s.do(s.client(), http.MethodGet, path)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(shell, `<div id="app"`) {
+			t.Fatalf("browser route %s must serve SPA shell: status=%d body=%s", path, resp.StatusCode, shell)
+		}
+	}
 
-	// --- Pengguna View Only: melihat, tidak bisa menjalankan migration.
 	v := s.login(viewer)
-	if _, body := s.do(v, "GET", "/dashboard", nil); !strings.Contains(body, connName) || !strings.Contains(body, "View Only") {
-		t.Fatal("viewer harus melihat database dengan label View Only")
+	resp, body = s.do(v, http.MethodGet, "/api/databases")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, connectionName) || !strings.Contains(body, "VIEW_ONLY") {
+		t.Fatalf("viewer should see database and access level: status=%d body=%s", resp.StatusCode, body)
 	}
-	if _, body := s.do(v, "GET", db+"?schema="+schema, nil); !strings.Contains(body, "items") {
-		t.Fatal("daftar tabel harus memuat items")
+	databasePath := "/api/databases/" + strconv.FormatInt(connectionID, 10)
+	if resp, body = s.do(v, http.MethodGet, databasePath); resp.StatusCode != http.StatusOK || !strings.Contains(body, schema) {
+		t.Fatalf("viewer should read database metadata: status=%d body=%s", resp.StatusCode, body)
 	}
-	if _, body := s.do(v, "GET", db+"/tables/"+schema+"/items", nil); !strings.Contains(body, "nama") || !strings.Contains(body, "PRIMARY KEY") || !strings.Contains(body, "items_pkey") {
-		t.Fatal("struktur tabel harus memuat kolom, constraint, dan index")
+	tablesPath := databasePath + "/tables?schema=" + schema
+	if resp, body = s.do(v, http.MethodGet, tablesPath); resp.StatusCode != http.StatusOK || !strings.Contains(body, "items") {
+		t.Fatalf("viewer should list tables through API: status=%d body=%s", resp.StatusCode, body)
 	}
-	_, body := s.do(v, "GET", db+"/tables/"+schema+"/items/data", nil)
-	if !strings.Contains(body, "Baris 1–50 dari 75") || !strings.Contains(body, `class="null">NULL<`) || strings.Contains(body, "<b>x</b>") || !strings.Contains(body, "&lt;b&gt;x&lt;/b&gt;") {
-		t.Fatal("data harus berpagination, menandai NULL, dan meng-escape HTML")
+	tablePath := databasePath + "/tables/" + schema + "/items"
+	if resp, body = s.do(v, http.MethodGet, tablePath); resp.StatusCode != http.StatusOK || !strings.Contains(body, "nama") {
+		t.Fatalf("table detail API status=%d body=%s", resp.StatusCode, body)
 	}
-	if _, body = s.do(v, "GET", db+"/tables/"+schema+"/items/data?page=2", nil); !strings.Contains(body, "Baris 51–75 dari 75") {
-		t.Fatal("halaman 2 tidak sesuai")
-	}
-	if r, _ := s.do(v, "GET", db+"/tables/"+schema+"/tidak_ada", nil); r.StatusCode != http.StatusNotFound {
-		t.Fatalf("tabel tidak ada: %d", r.StatusCode)
-	}
-	if r := s.post(v, db+"/migrations", url.Values{"sql": {"DROP TABLE " + schema + ".items"}}); r.StatusCode != http.StatusForbidden {
-		t.Fatalf("View Only menjalankan migration langsung: %d, ingin 403", r.StatusCode)
-	}
-	if _, body := s.do(v, "GET", db+"/migrations", nil); !strings.Contains(body, "Akses View Only") || strings.Contains(body, `name="sql"`) {
-		t.Fatal("View Only harus dapat melihat riwayat tanpa editor migration")
-	}
-	var n int
-	s.target.QueryRowContext(s.ctx, `SELECT COUNT(*) FROM `+schema+`.items`).Scan(&n)
-	if n != 75 {
-		t.Fatal("tabel target tidak boleh berubah")
+	if resp, body = s.do(v, http.MethodGet, tablePath+"/data"); resp.StatusCode != http.StatusOK ||
+		!strings.Contains(body, `"Total":75`) || strings.Contains(body, "<b>x</b>") {
+		t.Fatalf("table data API should paginate and escape values: status=%d body=%s", resp.StatusCode, body)
 	}
 
-	// --- Pengguna tanpa group: tidak melihat apa pun dan ditolak langsung.
-	e := s.login(editor)
-	if _, body := s.do(e, "GET", "/dashboard", nil); strings.Contains(body, connName) {
-		t.Fatal("pengguna tanpa akses tidak boleh melihat database")
+	validRevision := map[string]string{
+		"name": "approved-table-" + s.suffix, "description": "integration review",
+		"up_sql":   "CREATE TABLE " + schema + ".m2_demo (id integer)",
+		"down_sql": "DROP TABLE " + schema + ".m2_demo",
 	}
-	if r, _ := s.do(e, "GET", db, nil); r.StatusCode != http.StatusForbidden {
-		t.Fatalf("akses langsung tanpa izin: %d, ingin 403", r.StatusCode)
+	resp, body = s.api(v, http.MethodPost, databasePath+"/migrations", validRevision, true)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("View Only user must not create migration: status=%d body=%s", resp.StatusCode, body)
 	}
-	if r, _ := s.do(e, "GET", "/admin/users", nil); r.StatusCode != http.StatusForbidden {
-		t.Fatalf("halaman admin oleh non-admin: %d", r.StatusCode)
-	}
-
-	// --- Naikkan ke View + Edit lewat group lain: akses efektif tertinggi menang.
-	g2 := "it-edit-group-" + s.suffix
-	s.post(adm, "/admin/groups", url.Values{"name": {g2}})
-	var g2ID int64
-	s.db.QueryRowContext(s.ctx, `SELECT id FROM app_groups WHERE name=$1`, g2).Scan(&g2ID)
-	t.Cleanup(func() { s.db.Exec(`DELETE FROM app_groups WHERE id=$1`, g2ID) })
-	g2p := "/admin/groups/" + strconv.FormatInt(g2ID, 10)
-	s.post(adm, g2p+"/members", url.Values{"user_id": {uid(viewer)}})
-	s.post(adm, g2p+"/access", url.Values{"database_id": {strconv.FormatInt(connID, 10)}, "level": {"VIEW_EDIT"}})
-	if _, body := s.do(v, "GET", "/dashboard", nil); !strings.Contains(body, "View &#43; Edit") {
-		t.Fatal("akses efektif harus menjadi View + Edit")
-	}
-	// Milestone 2: pengguna View + Edit tetap tidak boleh menjalankan migration secara langsung melalui endpoint legacy.
-	// Eksekusi migration harus melalui revision, approval, queue, dan worker.
-	if r := s.post(v, db+"/migrations", url.Values{
-		"sql": {"SELECT 1"},
-	}); r.StatusCode != http.StatusGone {
-		t.Fatalf(
-			"View + Edit: endpoint migration langsung harus dinonaktifkan, dapat %d, ingin 410",
-			r.StatusCode,
-		)
-	}
-	// Halaman riwayat tetap harus bisa diakses oleh pengguna View + Edit.
-	if r, _ := s.do(v, "GET", db+"/migrations", nil); r.StatusCode != http.StatusOK {
-		t.Fatalf(
-			"View + Edit harus dapat melihat halaman riwayat migration, dapat %d",
-			r.StatusCode,
-		)
-	}
-	// Endpoint legacy tidak boleh mengeksekusi SQL atau menghasilkan migration history baru.
-	var migrationCount int
-	if err := s.db.QueryRowContext(
-		s.ctx,
-		`SELECT COUNT(*) FROM migration_history WHERE database_id = $1`,
-		connID,
-	).Scan(&migrationCount); err != nil {
-		t.Fatalf("gagal memeriksa migration history: %v", err)
-	}
-	if migrationCount != 0 {
-		t.Fatalf(
-			"endpoint legacy tidak boleh menghasilkan migration history, ditemukan %d",
-			migrationCount,
-		)
+	orphan := s.login(noAccess)
+	if resp, body = s.do(orphan, http.MethodGet, databasePath); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("user without group access must be denied, status=%d body=%s", resp.StatusCode, body)
 	}
 
-	// --- Hapus koneksi: viewer kehilangan akses dan Registry dibersihkan.
-	s.post(adm, "/admin/connections/"+strconv.FormatInt(connID, 10)+"/delete", url.Values{})
-	if r, _ := s.do(v, "GET", db, nil); r.StatusCode != http.StatusForbidden {
-		t.Fatalf("setelah koneksi dihapus: %d, ingin 403", r.StatusCode)
+	resp, body = s.api(adm, http.MethodPost, "/api/admin/groups", map[string]string{"name": secondGroup}, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create group %s: status=%d body=%s", secondGroup, resp.StatusCode, body)
+	}
+	secondID := groupID(t, s, secondGroup)
+	t.Cleanup(func() { s.db.Exec(`DELETE FROM app_groups WHERE id=$1`, secondID) })
+	for _, username := range []string{viewer, editor} {
+		path := fmt.Sprintf("/api/admin/groups/%d/members", secondID)
+		resp, body = s.api(adm, http.MethodPost, path, map[string]int64{"user_id": userID(t, s, username)}, true)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("add group member: status=%d body=%s", resp.StatusCode, body)
+		}
+	}
+	secondAccessPath := fmt.Sprintf("/api/admin/groups/%d/access", secondID)
+	resp, body = s.api(adm, http.MethodPost, secondAccessPath, map[string]any{"database_id": connectionID, "level": "VIEW_EDIT"}, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("grant View + Edit access: status=%d body=%s", resp.StatusCode, body)
+	}
+	secondLeaderPath := fmt.Sprintf("/api/admin/groups/%d/leader", secondID)
+	resp, body = s.api(adm, http.MethodPut, secondLeaderPath, map[string]int64{"user_id": userID(t, s, viewer)}, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set second group leader: status=%d body=%s", resp.StatusCode, body)
+	}
+	t.Cleanup(func() { s.db.Exec(`DELETE FROM database_connections WHERE id=$1`, connectionID) })
+
+	// The second group grants edit access, while both groups' approvals are snapshotted.
+	editorClient := s.login(editor)
+	resp, body = s.api(editorClient, http.MethodPost, databasePath+"/migrations", validRevision, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("editor creates M2 draft: status=%d body=%s", resp.StatusCode, body)
+	}
+	var created struct {
+		Data struct {
+			Migration struct {
+				ID int64 `json:"ID"`
+			} `json:"migration"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &created); err != nil || created.Data.Migration.ID <= 0 {
+		t.Fatalf("create response lacks migration ID: body=%s err=%v", body, err)
+	}
+	definitionID := created.Data.Migration.ID
+	definitionPath := "/api/migrations/" + strconv.FormatInt(definitionID, 10)
+	resp, body = s.api(editorClient, http.MethodPost, definitionPath+"/submit-review", map[string]any{}, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("submit review: status=%d body=%s", resp.StatusCode, body)
+	}
+	reviewer := s.login(viewer)
+	for _, id := range []int64{primaryID, secondID} {
+		path := definitionPath + "/revisions/1/approvals"
+		resp, body = s.api(reviewer, http.MethodPost, path, map[string]int64{"group_id": id}, true)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("leader approval for group %d: status=%d body=%s", id, resp.StatusCode, body)
+		}
+	}
+	resp, body = s.do(editorClient, http.MethodGet, definitionPath+"/readiness")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"ready":true`) {
+		t.Fatalf("review should be ready after all group approvals: status=%d body=%s", resp.StatusCode, body)
 	}
 
-	// --- Logout mencabut session.
-	s.post(v, "/logout", url.Values{})
-	if r, _ := s.do(v, "GET", "/dashboard", nil); r.StatusCode != http.StatusSeeOther {
-		t.Fatal("setelah logout dashboard harus mengarahkan ke login")
+	// Approval only prepares the revision; integration does not enqueue a real
+	// worker job so a running local worker cannot execute SQL against the target.
+	var migrationHistory int
+	if err := s.db.QueryRowContext(s.ctx, `SELECT COUNT(*) FROM migration_history WHERE database_id=$1`, connectionID).Scan(&migrationHistory); err != nil || migrationHistory != 0 {
+		t.Fatalf("workflow must not use legacy synchronous history: count=%d err=%v", migrationHistory, err)
+	}
+	var rowCount int
+	if err := s.target.QueryRowContext(s.ctx, `SELECT COUNT(*) FROM `+schema+`.items`).Scan(&rowCount); err != nil || rowCount != 75 {
+		t.Fatalf("review must not execute SQL against target: rows=%d err=%v", rowCount, err)
 	}
 }
 
-func TestDeletedUserSessionIsRejected(t *testing.T) {
+func TestDeletedUserSessionIsRejectedByAPI(t *testing.T) {
 	s := newStack(t)
 	name := "it-del-" + s.suffix
 	s.user(name, false)
 	c := s.login(name)
-	if r, _ := s.do(c, "GET", "/dashboard", nil); r.StatusCode != http.StatusOK {
-		t.Fatalf("dashboard: %d", r.StatusCode)
+	if resp, body := s.do(c, http.MethodGet, "/api/auth/me"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("session API status=%d body=%s", resp.StatusCode, body)
 	}
-	var id int64
-	s.db.QueryRowContext(s.ctx, `SELECT id FROM users WHERE username=$1`, name).Scan(&id)
+	id := userID(t, s, name)
 	if err := s.admin.DeleteUser(s.ctx, id); err != nil {
 		t.Fatal(err)
 	}
-	if r, _ := s.do(c, "GET", "/dashboard", nil); r.StatusCode != http.StatusSeeOther {
-		t.Fatalf("session user terhapus harus ditolak, dapat %d", r.StatusCode)
+	if resp, body := s.do(c, http.MethodGet, "/api/auth/me"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("deleted account session must be rejected, status=%d body=%s", resp.StatusCode, body)
+	}
+	if resp, shell := s.do(c, http.MethodGet, "/dashboard"); resp.StatusCode != http.StatusOK || !strings.Contains(shell, `<div id="app"`) {
+		t.Fatalf("browser route remains the SPA shell, status=%d", resp.StatusCode)
 	}
 }

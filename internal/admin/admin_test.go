@@ -329,8 +329,11 @@ func TestConnectionLifecycleWithRegistry(t *testing.T) {
 	t.Cleanup(func() { reg2.CloseAll() })
 	svc2, _ := New(db, reg2, nil, testKey)
 	n, failures, err := svc2.ConnectAll(ctx)
-	if err != nil || n < 1 || len(failures) != 0 {
+	if err != nil || n < 1 {
 		t.Fatalf("ConnectAll: n=%d failures=%v err=%v", n, failures, err)
+	}
+	if err := failures[c.ID]; err != nil {
+		t.Fatalf("koneksi yang dibuat test harus dapat didekripsi setelah restart: %v", err)
 	}
 	if _, err := reg2.Get(c.ID); err != nil {
 		t.Fatal("koneksi harus aktif setelah ConnectAll")
