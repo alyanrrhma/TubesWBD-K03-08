@@ -47,6 +47,7 @@ var (
 	ErrInvalidJob = errors.New("invalid migration job")
 	ErrUnapproved = errors.New("job must be revalidated against current approvals and immutable revision")
 	ErrUncertain  = errors.New("transaction commit outcome uncertain; manual reconciliation required")
+	ErrLostLease  = errors.New("worker lost its job lease")
 )
 
 // Job contains an immutable approved statement snapshot, NOT an SQL statement from the queue caller.

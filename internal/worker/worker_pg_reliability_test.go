@@ -3,9 +3,12 @@ package worker
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -85,7 +88,7 @@ func workerPGSetup(t *testing.T) *workerPGFixture {
 		_, _ = platform.ExecContext(c, `DELETE FROM users WHERE id=$1`, f.userID)
 		_, _ = target.ExecContext(c, `DROP TABLE IF EXISTS "`+f.table+`" CASCADE`)
 	})
-	f.worker = &Worker{Platform: platform, Targets: TargetResolverFunc(func(id int64) (*sql.DB, error) {
+	f.worker = &Worker{Platform: platform, DatabaseID: f.databaseID, Targets: TargetResolverFunc(func(id int64) (*sql.DB, error) {
 		if id != f.databaseID {
 			return nil, fmt.Errorf("unknown database %d", id)
 		}
@@ -243,6 +246,46 @@ func TestWorkerPGPartialCompensationResumesFromReverseCheckpoint(t *testing.T) {
 	}
 }
 
+func TestWorkerPGBatchUpdateAndDeleteRestoreUsingExplicitRecoveryData(t *testing.T) {
+	f := workerPGSetup(t)
+	archive := f.table + "_before"
+	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY,value text NOT NULL);
+		INSERT INTO "` + f.table + `" VALUES(1,'one'),(2,'two'),(3,'three'),(4,'four');
+		CREATE TABLE "` + archive + `"(id bigint PRIMARY KEY,value text NOT NULL);
+		INSERT INTO "` + archive + `" SELECT * FROM "` + f.table + `"`); err != nil {
+		t.Fatal(err)
+	}
+	updateUp := `UPDATE "` + f.table + `" SET value='changed' WHERE id=ANY($1::bigint[])`
+	updateDown := `UPDATE "` + f.table + `" AS current SET value=before.value FROM "` + archive + `" AS before WHERE current.id=before.id AND current.id=ANY($1::bigint[])`
+	update := f.enqueue(t, Forward, Batch, updateUp, updateDown, "", 2)
+	f.runOnce(t)
+	updateRollback := f.enqueue(t, Rollback, Batch, updateUp, updateDown, update.ExecutionID, 2)
+	f.runOnce(t)
+	var restored int
+	if err := f.target.QueryRow(`SELECT count(*) FROM "` + f.table + `" t JOIN "` + archive + `" a USING(id,value)`).Scan(&restored); err != nil || restored != 4 {
+		t.Fatalf("UPDATE compensation failed to restore before-image values: count=%d err=%v", restored, err)
+	}
+	deleteUp := `DELETE FROM "` + f.table + `" WHERE id=ANY($1::bigint[])`
+	deleteDown := `INSERT INTO "` + f.table + `"(id,value) SELECT id,value FROM "` + archive + `" WHERE id=ANY($1::bigint[]) ON CONFLICT(id) DO NOTHING`
+	deletion := f.enqueue(t, Forward, Batch, deleteUp, deleteDown, "", 2)
+	f.runOnce(t)
+	var remaining int
+	if err := f.target.QueryRow(`SELECT count(*) FROM "` + f.table + `"`).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("DELETE did not remove selected rows: count=%d err=%v", remaining, err)
+	}
+	deleteRollback := f.enqueue(t, Rollback, Batch, deleteUp, deleteDown, deletion.ExecutionID, 2)
+	f.runOnce(t)
+	if err := f.target.QueryRow(`SELECT count(*) FROM "` + f.table + `" t JOIN "` + archive + `" a USING(id,value)`).Scan(&restored); err != nil || restored != 4 {
+		t.Fatalf("DELETE compensation failed to restore archived rows: count=%d err=%v", restored, err)
+	}
+	for _, job := range []Job{updateRollback, deleteRollback} {
+		status, _, batches, rows := f.state(t, job)
+		if status != Success || batches != 2 || rows != 4 {
+			t.Errorf("compensation job %s status=%s batches=%d rows=%d", job.ID, status, batches, rows)
+		}
+	}
+}
+
 func TestWorkerPGStaleClaimProofRecovery(t *testing.T) {
 	f := workerPGSetup(t)
 	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY, processed boolean NOT NULL DEFAULT false); INSERT INTO "` + f.table + `"(id) SELECT generate_series(1,7)`); err != nil {
@@ -291,6 +334,160 @@ func TestWorkerPGStaleClaimProofRecovery(t *testing.T) {
 	}
 }
 
+// TestWorkerPGCrashSubprocessHelper is run as a separate OS process so os.Exit
+// closes PostgreSQL sessions exactly as a worker process crash would.
+func TestWorkerPGCrashSubprocessHelper(t *testing.T) {
+	if os.Getenv("WORKER_CRASH_HELPER") != "1" {
+		return
+	}
+	ctx := context.Background()
+	platform, err := sql.Open("pgx", os.Getenv("WORKER_TEST_PLATFORM_DATABASE_URL"))
+	if err != nil {
+		os.Exit(81)
+	}
+	target, err := sql.Open("pgx", os.Getenv("WORKER_TEST_TARGET_DATABASE_URL"))
+	if err != nil {
+		os.Exit(82)
+	}
+	defer platform.Close()
+	defer target.Close()
+	crashPoint := os.Getenv("WORKER_CRASH_POINT")
+	databaseID, _ := strconv.ParseInt(os.Getenv("WORKER_CRASH_DATABASE_ID"), 10, 64)
+	w := &Worker{Platform: platform, DatabaseID: databaseID, Targets: TargetResolverFunc(func(int64) (*sql.DB, error) { return target, nil }),
+		Validator: ValidatorFunc(func(context.Context, Job) error { return nil }),
+		crashPoint: func(point string) {
+			if point == crashPoint {
+				os.Exit(86)
+			}
+		}}
+	if err := w.RunOnce(ctx); err != nil {
+		os.Exit(83)
+	}
+	os.Exit(0)
+}
+
+func crashWorkerProcess(t *testing.T, f *workerPGFixture, point string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestWorkerPGCrashSubprocessHelper$")
+	cmd.Env = append(os.Environ(), "WORKER_CRASH_HELPER=1", "WORKER_CRASH_POINT="+point, "WORKER_CRASH_DATABASE_ID="+strconv.FormatInt(f.databaseID, 10))
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 86 {
+		t.Fatalf("worker did not crash at %s: err=%v output=%s", point, err, out)
+	}
+}
+
+func expireWorkerLease(t *testing.T, f *workerPGFixture, j Job) {
+	t.Helper()
+	if _, err := f.platform.Exec(`UPDATE migration_jobs SET heartbeat_at=NOW()-INTERVAL '1 second' WHERE id=$1 AND status='running'`, j.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.worker.LeaseTimeout = 100 * time.Millisecond
+	f.worker.HeartbeatInterval = 20 * time.Millisecond
+}
+
+func TestWorkerPGProcessCrashRecoveryAtSQLBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, crash    string
+		wantAfterCrash int
+	}{
+		{name: "before SQL", crash: "before_sql", wantAfterCrash: 0},
+		{name: "after SQL before commit", crash: "before_commit", wantAfterCrash: 0},
+		{name: "after commit before platform history", crash: "after_commit", wantAfterCrash: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := workerPGSetup(t)
+			if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY,counter integer NOT NULL DEFAULT 0); INSERT INTO "` + f.table + `" VALUES(1,0)`); err != nil {
+				t.Fatal(err)
+			}
+			j := f.enqueue(t, Forward, Normal, `UPDATE "`+f.table+`" SET counter=counter+1 WHERE id=1`, "", "", 0)
+			crashWorkerProcess(t, f, tc.crash)
+			var count int
+			if err := f.target.QueryRow(`SELECT counter FROM "` + f.table + `" WHERE id=1`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != tc.wantAfterCrash {
+				t.Fatalf("after crash counter=%d want %d", count, tc.wantAfterCrash)
+			}
+			var attempts int
+			if err := f.platform.QueryRow(`SELECT attempt FROM migration_jobs WHERE id=$1`, j.ID).Scan(&attempts); err != nil || attempts != 1 {
+				t.Fatalf("claim attempt=%d err=%v", attempts, err)
+			}
+			expireWorkerLease(t, f, j)
+			f.runOnce(t)
+			if err := f.target.QueryRow(`SELECT counter FROM "` + f.table + `" WHERE id=1`).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("recovery counter=%d err=%v", count, err)
+			}
+			status, attempts, _, _ := f.state(t, j)
+			if status != Success || attempts != 2 {
+				t.Fatalf("recovered status=%s attempts=%d", status, attempts)
+			}
+			var history, proof int
+			if err := f.platform.QueryRow(`SELECT count(*) FROM migration_worker_history WHERE execution_id=$1`, j.ExecutionID).Scan(&history); err != nil || history != 1 {
+				t.Fatalf("history=%d err=%v", history, err)
+			}
+			if err := f.target.QueryRow(`SELECT count(*) FROM __dbmp_worker_proof WHERE execution_id=$1 AND batch_no=0`, j.ExecutionID).Scan(&proof); err != nil || proof != 1 {
+				t.Fatalf("proof=%d err=%v", proof, err)
+			}
+		})
+	}
+}
+
+func TestWorkerPGCrashDuringRollbackDoesNotLoseOrDuplicateWork(t *testing.T) {
+	f := workerPGSetup(t)
+	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY,counter integer NOT NULL DEFAULT 0); INSERT INTO "` + f.table + `" VALUES(1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	apply := f.enqueue(t, Forward, Normal, `UPDATE "`+f.table+`" SET counter=counter+1 WHERE id=1`, "", "", 0)
+	f.runOnce(t)
+	rollback := f.enqueue(t, Rollback, Normal, `SELECT 1`, `UPDATE "`+f.table+`" SET counter=counter-1 WHERE id=1`, apply.ExecutionID, 0)
+	crashWorkerProcess(t, f, "before_commit")
+	var count int
+	if err := f.target.QueryRow(`SELECT counter FROM "` + f.table + `" WHERE id=1`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("uncommitted rollback escaped: counter=%d err=%v", count, err)
+	}
+	expireWorkerLease(t, f, rollback)
+	f.runOnce(t)
+	if err := f.target.QueryRow(`SELECT counter FROM "` + f.table + `" WHERE id=1`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rollback recovery counter=%d err=%v", count, err)
+	}
+	status, attempts, _, _ := f.state(t, rollback)
+	if status != Success || attempts != 2 {
+		t.Fatalf("rollback status=%s attempts=%d", status, attempts)
+	}
+	var history int
+	if err := f.platform.QueryRow(`SELECT count(*) FROM migration_worker_history WHERE execution_id=$1 AND operation='rollback' AND source_execution_id=$2`, rollback.ExecutionID, apply.ExecutionID).Scan(&history); err != nil || history != 1 {
+		t.Fatalf("rollback history=%d err=%v", history, err)
+	}
+}
+
+func TestWorkerPGCompensationResumeAfterProcessCrash(t *testing.T) {
+	f := workerPGSetup(t)
+	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY,value integer NOT NULL); INSERT INTO "` + f.table + `" SELECT i,0 FROM generate_series(1,6) i`); err != nil {
+		t.Fatal(err)
+	}
+	up := `UPDATE "` + f.table + `" SET value=value+10 WHERE id=ANY($1::bigint[])`
+	down := `UPDATE "` + f.table + `" SET value=value-10 WHERE id=ANY($1::bigint[])`
+	apply := f.enqueue(t, Forward, Batch, up, down, "", 3)
+	f.runOnce(t)
+	rollback := f.enqueue(t, Rollback, Batch, up, down, apply.ExecutionID, 3)
+	crashWorkerProcess(t, f, "rollback_before_commit")
+	var sum int
+	if err := f.target.QueryRow(`SELECT sum(value) FROM "` + f.table + `"`).Scan(&sum); err != nil || sum != 60 {
+		t.Fatalf("uncommitted compensation escaped: sum=%d err=%v", sum, err)
+	}
+	// An abrupt exit releases the target advisory lock; expire the queue lease.
+	expireWorkerLease(t, f, rollback)
+	f.runOnce(t)
+	if err := f.target.QueryRow(`SELECT sum(value) FROM "` + f.table + `"`).Scan(&sum); err != nil || sum != 0 {
+		t.Fatalf("compensation recovery sum=%d err=%v", sum, err)
+	}
+	status, attempts, batches, rows := f.state(t, rollback)
+	if status != Success || attempts != 2 || batches != 2 || rows != 6 {
+		t.Fatalf("rollback status=%s attempts=%d batches=%d rows=%d", status, attempts, batches, rows)
+	}
+}
+
 func TestWorkerPGPartialCommitAndFailedAttemptAudit(t *testing.T) {
 	f := workerPGSetup(t)
 	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY, processed boolean NOT NULL DEFAULT false); INSERT INTO "` + f.table + `"(id) SELECT generate_series(1,9)`); err != nil {
@@ -329,6 +526,40 @@ func TestWorkerPGPartialCommitAndFailedAttemptAudit(t *testing.T) {
 	// stops here rather than silently modifying immutable SQL to fake recovery.
 }
 
+func TestWorkerPGResumePartialAfterTransientBatchFailure(t *testing.T) {
+	f := workerPGSetup(t)
+	gate := f.table + "_gate"
+	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY,processed boolean NOT NULL DEFAULT false);
+		INSERT INTO "` + f.table + `"(id) SELECT generate_series(1,9);
+		CREATE TABLE "` + gate + `"(fail boolean NOT NULL); INSERT INTO "` + gate + `" VALUES(true)`); err != nil {
+		t.Fatal(err)
+	}
+	up := `UPDATE "` + f.table + `" SET processed=CASE WHEN id>5 AND (SELECT fail FROM "` + gate + `") THEN (id/(id-id))=1 ELSE true END WHERE id=ANY($1::bigint[])`
+	j := f.enqueue(t, Forward, Batch, up, `UPDATE "`+f.table+`" SET processed=false WHERE id=ANY($1::bigint[])`, "", 5)
+	f.runOnce(t)
+	if status, attempts, batches, rows := f.state(t, j); status != Partial || attempts != 1 || batches != 1 || rows != 5 {
+		t.Fatalf("first run status=%s attempts=%d batches=%d rows=%d", status, attempts, batches, rows)
+	}
+	if _, err := f.target.Exec(`UPDATE "` + gate + `" SET fail=false`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.platform.Exec(`UPDATE migration_jobs SET status='retrying',available_at=NOW(),finished_at=NULL WHERE id=$1 AND status='partial'`, j.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.runOnce(t)
+	if status, attempts, batches, rows := f.state(t, j); status != Success || attempts != 2 || batches != 2 || rows != 9 {
+		t.Fatalf("resume status=%s attempts=%d batches=%d rows=%d", status, attempts, batches, rows)
+	}
+	var processed int
+	if err := f.target.QueryRow(`SELECT count(*) FROM "` + f.table + `" WHERE processed`).Scan(&processed); err != nil || processed != 9 {
+		t.Fatalf("resume data processed=%d err=%v", processed, err)
+	}
+	var audit int
+	if err := f.platform.QueryRow(`SELECT count(*) FROM migration_job_attempts WHERE job_id=$1`, j.ID).Scan(&audit); err != nil || audit != 2 {
+		t.Fatalf("attempt history=%d err=%v", audit, err)
+	}
+}
+
 func TestWorkerPGTwoConsumersSingleExecution(t *testing.T) {
 	f := workerPGSetup(t)
 	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY,counter integer NOT NULL DEFAULT 0); INSERT INTO "` + f.table + `"(id) VALUES(1)`); err != nil {
@@ -355,5 +586,33 @@ func TestWorkerPGTwoConsumersSingleExecution(t *testing.T) {
 	status, attempts, _, _ := f.state(t, j)
 	if count != 1 || status != Success || attempts != 1 {
 		t.Fatalf("count=%d status=%s attempts=%d", count, status, attempts)
+	}
+}
+
+func TestWorkerPGLostLeaseStopsBeforeSubmittingSQL(t *testing.T) {
+	f := workerPGSetup(t)
+	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `"(id bigint PRIMARY KEY,counter integer NOT NULL DEFAULT 0); INSERT INTO "` + f.table + `" VALUES(1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	j := f.enqueue(t, Forward, Normal, `UPDATE "`+f.table+`" SET counter=counter+1 WHERE id=1`, "", "", 0)
+	f.worker.crashPoint = func(point string) {
+		if point == "before_sql" {
+			if _, err := f.platform.Exec(`UPDATE migration_jobs SET attempt=attempt+1 WHERE id=$1 AND status='running'`, j.ID); err != nil {
+				t.Errorf("simulate lease takeover: %v", err)
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := f.worker.RunOnce(ctx); !errors.Is(err, ErrLostLease) {
+		t.Fatalf("RunOnce error=%v want ErrLostLease", err)
+	}
+	var count int
+	if err := f.target.QueryRow(`SELECT counter FROM "` + f.table + `" WHERE id=1`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("stale worker executed SQL: counter=%d err=%v", count, err)
+	}
+	var history int
+	if err := f.platform.QueryRow(`SELECT count(*) FROM migration_worker_history WHERE execution_id=$1`, j.ExecutionID).Scan(&history); err != nil || history != 0 {
+		t.Fatalf("stale worker wrote history=%d err=%v", history, err)
 	}
 }
