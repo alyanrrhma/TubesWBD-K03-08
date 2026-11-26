@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/auth"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/config"
@@ -43,60 +44,59 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /static/", http.StripPrefix("/static/", s.staticCache(http.FileServerFS(static))))
 	mux.HandleFunc("GET /healthz", s.healthz)
 
-	mux.HandleFunc("GET /login", s.loginForm)
-	mux.HandleFunc("POST /login", s.loginSubmit)
+	// JSON API: autentikasi tetap menggunakan session cookie M1 dan CSRF token.
+	mux.HandleFunc("POST /api/auth/login", s.apiLogin)
+	mux.Handle("GET /api/auth/me", s.apiAuth(http.HandlerFunc(s.apiMe)))
+	mux.Handle("POST /api/auth/logout", s.apiAuth(s.apiCSRF(http.HandlerFunc(s.apiLogout))))
 
-	// Terlindungi: wajib session; method non-GET wajib Origin sesuai + token CSRF
-	authed := func(h http.HandlerFunc) http.Handler { return s.requireAuth(s.csrfProtect(h)) }
-	admin := func(h http.HandlerFunc) http.Handler {
-		return s.requireAuth(s.requireAdmin(s.csrfProtect(h)))
-	}
+	mux.Handle("GET /api/databases", s.apiAuth(http.HandlerFunc(s.apiDatabases)))
+	mux.Handle("GET /api/databases/{databaseID}", s.apiAuth(http.HandlerFunc(s.apiDatabase)))
+	mux.Handle("GET /api/databases/{databaseID}/tables", s.apiAuth(http.HandlerFunc(s.apiTables)))
+	mux.Handle("GET /api/databases/{databaseID}/tables/{schema}/{table}", s.apiAuth(http.HandlerFunc(s.apiTableDetail)))
+	mux.Handle("GET /api/databases/{databaseID}/tables/{schema}/{table}/data", s.apiAuth(http.HandlerFunc(s.apiTableData)))
+	mux.Handle("GET /api/databases/{databaseID}/migrations", s.apiAuth(http.HandlerFunc(s.apiMigrationHistory)))
+	mux.Handle("GET /api/databases/{databaseID}/migrations/{version}", s.apiAuth(http.HandlerFunc(s.apiMigrationDetail)))
+	mux.Handle("POST /api/databases/{databaseID}/migrations", s.apiAuth(s.apiCSRF(http.HandlerFunc(s.apiMigrationExecute))))
 
-	mux.Handle("GET /{$}", authed(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-	}))
-	mux.Handle("POST /logout", authed(s.logout))
-	mux.Handle("GET /dashboard", authed(s.dashboard))
+	// Platform Admin API.
+	mux.Handle("GET /api/admin/users", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminUsers))))
+	mux.Handle("POST /api/admin/users", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminUsers))))
+	mux.Handle("DELETE /api/admin/users/{id}", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminUser))))
+	mux.Handle("GET /api/admin/groups", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminGroups))))
+	mux.Handle("POST /api/admin/groups", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminGroups))))
+	mux.Handle("GET /api/admin/groups/{id}", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminGroup))))
+	mux.Handle("POST /api/admin/groups/{id}/members", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminGroupMembers))))
+	mux.Handle("DELETE /api/admin/groups/{id}/members/{userID}", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminGroupMembers))))
+	mux.Handle("POST /api/admin/groups/{id}/access", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminGroupAccess))))
+	mux.Handle("DELETE /api/admin/groups/{id}/access/{dbID}", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminGroupAccess))))
+	mux.Handle("GET /api/admin/connections", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminConnections))))
+	mux.Handle("POST /api/admin/connections", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminConnections))))
+	mux.Handle("PUT /api/admin/connections/{id}", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminConnection))))
+	mux.Handle("DELETE /api/admin/connections/{id}", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminConnection))))
+	mux.Handle("POST /api/admin/connections/{id}/test", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminConnectionTest))))
 
-	// Viewer dan migration. Nama wildcard {databaseID} sama dengan yang dipakai access.Middleware
-	mux.Handle("GET /databases/{databaseID}", authed(s.databasePage))
-	mux.Handle("GET /databases/{databaseID}/tables/{schema}/{table}", authed(s.tableStructure))
-	mux.Handle("GET /databases/{databaseID}/tables/{schema}/{table}/data", authed(s.tableData))
-	mux.Handle("GET /databases/{databaseID}/migrations", authed(s.migrationsPage))
-	mux.Handle("GET /databases/{databaseID}/migrations/{version}", authed(s.migrationDetailPage))
-	mux.Handle("POST /databases/{databaseID}/migrations/explain", authed(s.migrationsExplain))
-	mux.Handle("GET /databases/{databaseID}/schema-diff", authed(s.schemaDiffPage))
-	mux.Handle("POST /databases/{databaseID}/schema-diff", authed(s.schemaDiffSubmit))
-	mux.Handle("POST /databases/{databaseID}/migrations", authed(s.migrationsExecute))
-
-	// Admin (hanya Platform Admin)
-	mux.Handle("GET /admin", admin(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/admin/users", http.StatusSeeOther)
-	}))
-	mux.Handle("GET /admin/users", admin(s.usersPage))
-	mux.Handle("POST /admin/users", admin(s.usersCreate))
-	mux.Handle("POST /admin/users/{id}/delete", admin(s.usersDelete))
-
-	mux.Handle("GET /admin/groups", admin(s.groupsPage))
-	mux.Handle("POST /admin/groups", admin(s.groupsCreate))
-	mux.Handle("GET /admin/groups/{id}", admin(s.groupPage))
-	mux.Handle("POST /admin/groups/{id}/delete", admin(s.groupsDelete))
-	mux.Handle("POST /admin/groups/{id}/members", admin(s.membersAdd))
-	mux.Handle("POST /admin/groups/{id}/members/{userID}/remove", admin(s.membersRemove))
-	mux.Handle("POST /admin/groups/{id}/access", admin(s.accessGrant))
-	mux.Handle("POST /admin/groups/{id}/access/{dbID}/revoke", admin(s.accessRevoke))
-
-	mux.Handle("GET /admin/connections", admin(s.connectionsPage))
-	mux.Handle("POST /admin/connections", admin(s.connectionsCreate))
-	mux.Handle("POST /admin/connections/{id}", admin(s.connectionsUpdate))
-	mux.Handle("POST /admin/connections/{id}/test", admin(s.connectionsTest))
-	mux.Handle("POST /admin/connections/{id}/delete", admin(s.connectionsDelete))
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		s.errorPage(w, r, http.StatusNotFound, "Halaman tidak ditemukan", "Alamat yang Anda buka tidak ada.")
-	})
+	// Semua route non-API mengirim satu shell SPA. Navigasi dilakukan di browser.
+	mux.HandleFunc("GET /{$}", s.spaShell)
+	mux.HandleFunc("GET /", s.spaShell)
 
 	return s.recoverer(s.logging(s.securityHeaders(mux)))
+}
+
+func (s *Server) spaShell(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/static/") {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := webassets.FS.ReadFile("templates/spa.html")
+	if err != nil {
+		s.Logger.Error("SPA shell tidak dapat dibaca", "error", err)
+		http.Error(w, "Terjadi kesalahan pada server.", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
