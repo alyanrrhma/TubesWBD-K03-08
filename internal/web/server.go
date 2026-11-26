@@ -57,6 +57,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/databases/{databaseID}/migrations", s.apiAuth(http.HandlerFunc(s.apiMigrationHistory)))
 	mux.Handle("GET /api/databases/{databaseID}/migrations/{version}", s.apiAuth(http.HandlerFunc(s.apiMigrationDetail)))
 	mux.Handle("POST /api/databases/{databaseID}/migrations", s.apiAuth(s.apiCSRF(http.HandlerFunc(s.apiMigrationExecute))))
+	mux.Handle("POST /api/databases/{databaseID}/migrations/explain", s.apiAuth(s.apiCSRF(http.HandlerFunc(s.apiMigrationExplain))))
 
 	// Platform Admin API.
 	mux.Handle("GET /api/admin/users", s.apiAdmin(s.apiCSRF(http.HandlerFunc(s.apiAdminUsers))))

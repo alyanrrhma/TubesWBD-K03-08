@@ -285,6 +285,26 @@ func (s *Server) apiMigrationExecute(w http.ResponseWriter, r *http.Request) {
 	}
 	apiJSON(w, http.StatusCreated, item)
 }
+
+func (s *Server) apiMigrationExplain(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.apiPathID(w, r, "databaseID")
+	if !ok {
+		return
+	}
+	var in struct {
+		SQL     string `json:"sql"`
+		Analyze bool   `json:"analyze"`
+	}
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	plan, err := s.Migrations.Explain(r.Context(), currentUser(r).ID, id, in.SQL, in.Analyze)
+	if err != nil {
+		s.apiServiceError(w, err)
+		return
+	}
+	apiJSON(w, http.StatusOK, map[string]any{"plan": plan})
+}
 func (s *Server) apiServiceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, access.ErrForbidden):
