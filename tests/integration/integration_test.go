@@ -25,6 +25,7 @@ import (
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/platformdb"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/web"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 	"github.com/joho/godotenv"
 )
 
@@ -378,15 +379,122 @@ func TestEndToEndSPAMigrationReviewAndViewerAccess(t *testing.T) {
 		t.Fatalf("review should be ready after all group approvals: status=%d body=%s", resp.StatusCode, body)
 	}
 
-	// Approval only prepares the revision; integration does not enqueue a real
-	// worker job so a running local worker cannot execute SQL against the target.
+	// Exercise actual durable apply, rollback, and forward jobs against PostgreSQL.
+	applyResp, applyBody := s.api(editorClient, http.MethodPost, definitionPath+"/submit", map[string]any{}, true)
+	if applyResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("submit apply status=%d body=%s", applyResp.StatusCode, applyBody)
+	}
+	var applyJob struct {
+		Data struct {
+			JobID string `json:"job_id"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal([]byte(applyBody), &applyJob); err != nil || applyJob.Data.JobID == "" {
+		t.Fatalf("apply job response=%s err=%v", applyBody, err)
+	}
+	runWorkflowWorker(t, s, connectionID)
+	assertWorkflowJobStatus(t, s, applyJob.Data.JobID, "success")
+	var applied bool
+	if err = s.target.QueryRowContext(s.ctx, `SELECT to_regclass($1) IS NOT NULL`, schema+`.m2_demo`).Scan(&applied); err != nil || !applied {
+		t.Fatalf("apply did not create target table: applied=%v err=%v", applied, err)
+	}
+
+	rollbackJobID := submitOperationReview(t, s, editorClient, reviewer, definitionID, "rollback")
+	runWorkflowWorker(t, s, connectionID)
+	assertWorkflowJobStatus(t, s, rollbackJobID, "success")
+	if err = s.target.QueryRowContext(s.ctx, `SELECT to_regclass($1) IS NOT NULL`, schema+`.m2_demo`).Scan(&applied); err != nil || applied {
+		t.Fatalf("rollback did not remove target table: applied=%v err=%v", applied, err)
+	}
+	forwardJobID := submitOperationReview(t, s, editorClient, reviewer, definitionID, "forward")
+	runWorkflowWorker(t, s, connectionID)
+	assertWorkflowJobStatus(t, s, forwardJobID, "success")
+	if err = s.target.QueryRowContext(s.ctx, `SELECT to_regclass($1) IS NOT NULL`, schema+`.m2_demo`).Scan(&applied); err != nil || !applied {
+		t.Fatalf("forward did not recreate target table: applied=%v err=%v", applied, err)
+	}
+	permissionRaceJob := submitOperationReview(t, s, editorClient, reviewer, definitionID, "rollback")
+	resp, body = s.api(adm, http.MethodDelete, fmt.Sprintf("/api/admin/groups/%d/access/%d", primaryID, connectionID), nil, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke permission after queue status=%d body=%s", resp.StatusCode, body)
+	}
+	runWorkflowWorker(t, s, connectionID)
+	assertWorkflowJobStatus(t, s, permissionRaceJob, "failed")
+	if err = s.target.QueryRowContext(s.ctx, `SELECT to_regclass($1) IS NOT NULL`, schema+`.m2_demo`).Scan(&applied); err != nil || !applied {
+		t.Fatalf("worker executed after approval permission snapshot changed: applied=%v err=%v", applied, err)
+	}
+	var operationCount int
+	if err = s.db.QueryRowContext(s.ctx, `SELECT count(*) FROM migration_worker_history WHERE database_id=$1 AND migration_id=$2`, connectionID, definitionID).Scan(&operationCount); err != nil || operationCount != 3 {
+		t.Fatalf("failed permission-revalidated rollback must not add execution history: count=%d err=%v", operationCount, err)
+	}
+
 	var migrationHistory int
 	if err := s.db.QueryRowContext(s.ctx, `SELECT COUNT(*) FROM migration_history WHERE database_id=$1`, connectionID).Scan(&migrationHistory); err != nil || migrationHistory != 0 {
-		t.Fatalf("workflow must not use legacy synchronous history: count=%d err=%v", migrationHistory, err)
+		t.Fatalf("M2 worker operations must not write legacy synchronous history: count=%d err=%v", migrationHistory, err)
 	}
 	var rowCount int
 	if err := s.target.QueryRowContext(s.ctx, `SELECT COUNT(*) FROM `+schema+`.items`).Scan(&rowCount); err != nil || rowCount != 75 {
-		t.Fatalf("review must not execute SQL against target: rows=%d err=%v", rowCount, err)
+		t.Fatalf("migration workflow changed unrelated viewer data: rows=%d err=%v", rowCount, err)
+	}
+}
+
+func submitOperationReview(t *testing.T, s *stack, editor, reviewer *http.Client, definitionID int64, operation string) string {
+	t.Helper()
+	path := fmt.Sprintf("/api/migrations/%d/operations/%s/review", definitionID, operation)
+	resp, body := s.api(editor, http.MethodPost, path, map[string]any{}, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("start %s review status=%d body=%s", operation, resp.StatusCode, body)
+	}
+	var reviewResponse struct {
+		Data struct {
+			Review struct {
+				ID     int64 `json:"id"`
+				Groups []struct {
+					GroupID int64 `json:"group_id"`
+				} `json:"groups"`
+			} `json:"review"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &reviewResponse); err != nil || reviewResponse.Data.Review.ID <= 0 || len(reviewResponse.Data.Review.Groups) != 2 {
+		t.Fatalf("%s review response=%s err=%v", operation, body, err)
+	}
+	reviewID := reviewResponse.Data.Review.ID
+	for _, group := range reviewResponse.Data.Review.Groups {
+		resp, body = s.api(reviewer, http.MethodPost, fmt.Sprintf("/api/operation-reviews/%d/approvals", reviewID), map[string]any{"group_id": group.GroupID, "decision": "approved"}, true)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("approve %s group %d status=%d body=%s", operation, group.GroupID, resp.StatusCode, body)
+		}
+	}
+	resp, body = s.api(editor, http.MethodPost, fmt.Sprintf("/api/operation-reviews/%d/submit", reviewID), map[string]any{}, true)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("submit %s review status=%d body=%s", operation, resp.StatusCode, body)
+	}
+	var submitted struct {
+		Data struct {
+			JobID string `json:"job_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &submitted); err != nil || submitted.Data.JobID == "" {
+		t.Fatalf("submit %s response=%s err=%v", operation, body, err)
+	}
+	return submitted.Data.JobID
+}
+
+func runWorkflowWorker(t *testing.T, s *stack, databaseID int64) {
+	t.Helper()
+	authorizer := migration.AccessAuthorizer{Access: access.Service{Repo: access.PostgresRepository{DB: s.db}}}
+	wf := migration.NewWorkflowService(s.db, authorizer)
+	w := &worker.Worker{Platform: s.db, DatabaseID: databaseID, Targets: worker.TargetResolverFunc(func(int64) (*sql.DB, error) { return s.target, nil }), Validator: wf.Revalidator}
+	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+	defer cancel()
+	if err := w.RunOnce(ctx); err != nil {
+		t.Fatalf("worker RunOnce: %v", err)
+	}
+}
+
+func assertWorkflowJobStatus(t *testing.T, s *stack, jobID, want string) {
+	t.Helper()
+	var got string
+	if err := s.db.QueryRowContext(s.ctx, `SELECT status FROM migration_jobs WHERE id=$1`, jobID).Scan(&got); err != nil || got != want {
+		t.Fatalf("job %s status=%s want %s err=%v", jobID, got, want, err)
 	}
 }
 
