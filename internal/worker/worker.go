@@ -300,8 +300,8 @@ func (w *Worker) resume(ctx context.Context, c *sql.Conn, j Job) (int64, int64, 
 			return 0, 0, 0, err
 		}
 		upper = maximum.Int64
-		if _, err = tx.ExecContext(ctx, `INSERT INTO __dbmp_worker_proof(execution_id,batch_no,batch_ids) VALUES($1,-1,jsonb_build_array($2)) ON CONFLICT DO NOTHING`, j.ExecutionID, upper); err != nil {
-			return 0, 0, 0, err
+		if _, err = tx.ExecContext(ctx, `INSERT INTO __dbmp_worker_proof(execution_id,batch_no,batch_ids) VALUES($1,-1,jsonb_build_array($2::bigint)) ON CONFLICT DO NOTHING`, j.ExecutionID, upper); err != nil {
+			return 0, 0, 0, fmt.Errorf("persist batch upper bound: %w", err)
 		}
 	} else if err != nil {
 		return 0, 0, 0, err
@@ -404,7 +404,7 @@ func selectIDs(ctx context.Context, tx *sql.Tx, table string, cursor, upper int6
 	if !identifier.MatchString(table) {
 		return nil, ErrInvalidJob
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM "`+table+`" WHERE id>$1 AND id<=$2 ORDER BY id LIMIT $3`, cursor, upper, limit)
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM "`+table+`" WHERE id>$1::bigint AND id<=$2::bigint ORDER BY id LIMIT $3::integer`, cursor, upper, limit)
 	if err != nil {
 		return nil, err
 	}
