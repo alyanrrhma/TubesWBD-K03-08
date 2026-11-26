@@ -19,6 +19,7 @@ import (
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/platformdb"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/web"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 func main() {
@@ -87,6 +88,22 @@ func run(log *slog.Logger) error {
 
 	migrations := migration.NewService(platformDB, targets, migration.AccessAuthorizer{Access: accessService})
 	workflow := migration.NewWorkflowService(platformDB, migration.AccessAuthorizer{Access: accessService})
+	jobWorker := &worker.Worker{Platform: platformDB, Targets: targets, Validator: workflow.Revalidator, Logger: log}
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		if err := jobWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("migration worker berhenti", "err", err)
+		}
+	}()
+	defer func() {
+		stop()
+		select {
+		case <-workerDone:
+		case <-time.After(10 * time.Second):
+			log.Warn("migration worker belum berhenti setelah timeout")
+		}
+	}()
 	server, err := web.New(web.Deps{
 		Config:     cfg,
 		Logger:     log,
