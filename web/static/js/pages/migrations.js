@@ -1,6 +1,7 @@
 import { request } from "../api/client.js";
 import { escapeHTML } from "../router.js";
 import { loading } from "../components/layout.js";
+import { renderMigrationWorkflow } from "./migration-workflow.js";
 
 export async function migrationsPage(root, shell, user, { id }) {
   root.innerHTML = shell(user, "Migration", loading);
@@ -29,9 +30,14 @@ export async function migrationsPage(root, shell, user, { id }) {
         <a href="/databases/${id}" data-link>Schema dan tabel</a>
         <a href="/databases/${id}/migrations" data-link aria-current="page">Migration</a>
       </nav>
+      <section id="migration-workflow">
+        <h2>Migration workflow M2</h2>
+        <p class="muted">Buat revision draft, kirim untuk persetujuan group, lalu antrekan eksekusi melalui worker.</p>
+        <div id="migration-workflow-content" aria-live="polite">${loading}</div>
+      </section>
       ${canEdit ? `
         <section>
-          <h2>Migration baru</h2>
+          <h2>Analisis SQL</h2>
           <div class="stack">
             <label for="migration-sql">SQL</label>
             <textarea id="migration-sql" name="sql" class="sql" rows="9" maxlength="1048576" spellcheck="false" placeholder="ALTER TABLE customers ADD COLUMN phone TEXT;"></textarea>
@@ -39,11 +45,10 @@ export async function migrationsPage(root, shell, user, { id }) {
             <div class="actions">
               <button class="btn btn-secondary" type="button" id="explain-migration">Analisis execution plan</button>
               <button class="btn btn-secondary" type="button" id="analyze-migration">Jalankan EXPLAIN ANALYZE</button>
-              <button class="btn" type="button" disabled>Eksekusi lewat workflow M2 belum tersedia di UI</button>
             </div>
             <p id="migration-error" class="flash flash-error" role="alert" hidden></p>
           </div>
-          <p class="notice">Eksekusi langsung M1 sudah dinonaktifkan. Migration M2 harus dibuat sebagai draft, disetujui, lalu dikirim ke worker.</p>
+          <p class="notice">Alat ini hanya menganalisis SQL. Eksekusi migration dilakukan lewat workflow M2 di atas.</p>
           <section id="migration-plan" aria-live="polite" hidden>
             <h3 id="migration-plan-title"></h3>
             <p id="migration-plan-description" class="muted"></p>
@@ -74,6 +79,7 @@ export async function migrationsPage(root, shell, user, { id }) {
         </nav>` : ""}
       </section>`);
 
+    await renderMigrationWorkflow(root, id, user, canEdit);
     if (!canEdit) return;
 
     const sqlInput = root.querySelector("#migration-sql");

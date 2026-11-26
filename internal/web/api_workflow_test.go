@@ -111,6 +111,17 @@ func TestAPIWorkflowReviewStatusAndReadiness(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"status":"PENDING_REVIEW"`) || !strings.Contains(body, `"completed_approvals":1`) {
 		t.Fatalf("review status=%d body=%s", resp.StatusCode, body)
 	}
+	e.workflow.review = migration.ReviewStatus{
+		DefinitionID: 7, RevisionID: 9, Revision: 1, Status: migration.WorkflowInReview,
+		RequiredApprovals: 2, CompletedApprovals: 1,
+		RequiredGroups: []migration.ReviewGroup{
+			{GroupID: 3, GroupName: "reviewers", LeaderUserID: 12, Decision: "pending"},
+		},
+	}
+	resp, body = e.get(c, "/api/migrations/7/review")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"group_name":"reviewers"`) || !strings.Contains(body, `"leader_user_id":12`) {
+		t.Fatalf("review group snapshot missing from response: status=%d body=%s", resp.StatusCode, body)
+	}
 	e.workflow.review = migration.ReviewStatus{DefinitionID: 7, RevisionID: 9, Revision: 1, Status: migration.WorkflowApproved, RequiredApprovals: 2, CompletedApprovals: 2, Ready: true}
 	resp, body = e.get(c, "/api/migrations/7/readiness")
 	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"ready":true`) || !strings.Contains(body, `"workflow_status":"APPROVED"`) {
@@ -162,6 +173,27 @@ func TestAPIWorkflowSubmitJobReturnsIdentifiersWithoutWaiting(t *testing.T) {
 	resp, body = apiRequest(t, e, c, http.MethodPost, "/api/migrations/7/submit", `{}`, csrf)
 	if resp.StatusCode != http.StatusConflict || !strings.Contains(body, `"code":"database_execution_blocked"`) {
 		t.Fatalf("enqueue error status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestAPIWorkflowExecutionOperationsAreReadOnlyStatus(t *testing.T) {
+	e := newEnv(t)
+	c := e.login("alice")
+	e.workflow.operations = migration.MigrationOperations{
+		LastOperation: "apply", LastExecutionID: "exec-1", Revision: 2,
+		ActiveJob: &migration.ActiveMigrationJob{JobID: "job-active", ExecutionID: "exec-active", Operation: "rollback", Status: "running"},
+		Apply:     migration.OperationAvailability{Reason: "Migration already executed."},
+		Rollback:  migration.OperationAvailability{Available: true},
+		Forward:   migration.OperationAvailability{Reason: "State terakhir bukan rollback."},
+	}
+	resp, body := e.get(c, "/api/migrations/7/operations")
+	if resp.StatusCode != http.StatusOK ||
+		!strings.Contains(body, `"last_operation":"apply"`) ||
+		!strings.Contains(body, `"active_job":{"job_id":"job-active"`) ||
+		!strings.Contains(body, `"apply":{"available":false,"reason":"Migration already executed."}`) ||
+		!strings.Contains(body, `"rollback":{"available":true}`) ||
+		!strings.Contains(body, `"forward":{"available":false,"reason":"State terakhir bukan rollback."}`) {
+		t.Fatalf("operations status=%d body=%s", resp.StatusCode, body)
 	}
 }
 

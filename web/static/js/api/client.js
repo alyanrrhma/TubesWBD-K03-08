@@ -19,8 +19,27 @@ export async function request(path, options = {}) {
     : await response.text();
   if (!response.ok) {
     if (response.status === 401) window.dispatchEvent(new CustomEvent("dbmp:unauthorized"));
-    const message = payload && typeof payload === "object" ? payload.error : payload;
-    throw new Error(message || `Request gagal (${response.status})`);
+    const apiError = payload && typeof payload === "object" ? payload.error : null;
+    const message = typeof apiError === "string"
+      ? apiError
+      : apiError && typeof apiError === "object" && typeof apiError.message === "string"
+        ? apiError.message
+        : payload && typeof payload === "object" && typeof payload.message === "string"
+          ? payload.message
+          : typeof payload === "string" && payload
+            ? payload
+            : `Request gagal (${response.status})`;
+    const error = new Error(message);
+    error.status = response.status;
+    if (apiError && typeof apiError === "object" && typeof apiError.code === "string") {
+      error.code = apiError.code;
+    }
+    throw error;
+  }
+  if (payload && typeof payload === "object"
+      && Object.prototype.hasOwnProperty.call(payload, "data")
+      && Object.keys(payload).length === 1) {
+    return payload.data;
   }
   return payload;
 }

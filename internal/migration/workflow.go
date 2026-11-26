@@ -83,7 +83,15 @@ type ReviewStatus struct {
 	CompletedApprovals int            `json:"completed_approvals"`
 	RejectedApprovals  int            `json:"rejected_approvals"`
 	MissingLeaders     int            `json:"missing_leaders"`
+	RequiredGroups     []ReviewGroup  `json:"required_groups,omitempty"`
 	Ready              bool           `json:"ready"`
+}
+
+type ReviewGroup struct {
+	GroupID      int64  `json:"group_id"`
+	GroupName    string `json:"group_name"`
+	LeaderUserID int64  `json:"leader_user_id"`
+	Decision     string `json:"decision"`
 }
 
 type GroupLeader struct {
@@ -530,6 +538,27 @@ func (r WorkflowRepository) ReviewStatus(ctx context.Context, definitionID int64
 		return s, ErrWorkflowNotFound
 	}
 	if err != nil {
+		return s, err
+	}
+	rows, err := r.DB.QueryContext(ctx, `SELECT rg.group_id,g.name,rg.leader_user_id,COALESCE(a.decision,'pending')
+		FROM migration_review_groups rg
+		JOIN app_groups g ON g.id=rg.group_id
+		LEFT JOIN migration_approvals a ON a.revision_id=rg.revision_id
+			AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id
+		WHERE rg.revision_id=$1 ORDER BY lower(g.name),rg.group_id`, s.RevisionID)
+	if err != nil {
+		return s, err
+	}
+	defer rows.Close()
+	s.RequiredGroups = make([]ReviewGroup, 0)
+	for rows.Next() {
+		var group ReviewGroup
+		if err := rows.Scan(&group.GroupID, &group.GroupName, &group.LeaderUserID, &group.Decision); err != nil {
+			return s, err
+		}
+		s.RequiredGroups = append(s.RequiredGroups, group)
+	}
+	if err := rows.Err(); err != nil {
 		return s, err
 	}
 	s.Ready = s.Status == WorkflowApproved && s.RequiredApprovals > 0 && s.CompletedApprovals == s.RequiredApprovals && s.MissingLeaders == 0

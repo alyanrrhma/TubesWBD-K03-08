@@ -325,6 +325,22 @@ func (s *Server) apiReadiness(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, 200, map[string]any{"ready": ready, "workflow": state, "revision": v})
 }
 
+func (s *Server) apiExecutionOperations(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	id, ok := apiID(w, r, "definitionID")
+	if !ok {
+		return
+	}
+	operations, err := s.Workflow.ExecutionOperations(r.Context(), currentUser(r).ID, id)
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusOK, map[string]any{"operations": operations})
+}
+
 func (s *Server) apiSubmitJob(w http.ResponseWriter, r *http.Request) {
 	if !requireWorkflow(s, w) {
 		return

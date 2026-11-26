@@ -79,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/migrations/{definitionID}/revisions/{revision}/approvals", workflowAPI(s.apiApprove))
 	mux.Handle("POST /api/migrations/{definitionID}/revisions/{revision}/rejection", workflowAPI(s.apiReject))
 	mux.Handle("GET /api/migrations/{definitionID}/readiness", workflowAPI(s.apiReadiness))
+	mux.Handle("GET /api/migrations/{definitionID}/operations", workflowAPI(s.apiExecutionOperations))
 	mux.Handle("POST /api/migrations/{definitionID}/submit", workflowAPI(s.apiSubmitJob))
 	mux.Handle("GET /api/jobs/{jobID}", workflowAPI(s.apiGetJobStatus))
 	mux.Handle("POST /api/migrations/{definitionID}/rollback", workflowAPI(s.apiSubmitRollbackJob))

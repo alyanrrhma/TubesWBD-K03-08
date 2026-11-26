@@ -185,6 +185,12 @@ func TestWorkflowReviewPartialAndCompleteApproval(t *testing.T) {
 	if _, err = f.svc.SubmitReview(ctx, f.user1, d.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = f.db.Exec(`INSERT INTO user_groups(user_id,group_id) VALUES($1,$2)`, f.nonLeader, f.group2); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.svc.SetGroupLeader(ctx, f.group2, f.nonLeader); err != nil {
+		t.Fatalf("reassign current group leader: %v", err)
+	}
 	_, complete, err := f.svc.Approve(ctx, f.user1, v.ID, f.group1)
 	if err != nil || complete {
 		t.Fatalf("partial approval complete=%v err=%v", complete, err)
@@ -199,8 +205,16 @@ func TestWorkflowReviewPartialAndCompleteApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := f.svc.ReviewStatus(ctx, f.user1, d.ID)
-	if err != nil || status.RequiredApprovals != 2 || status.CompletedApprovals != 1 {
+	if err != nil || status.RequiredApprovals != 2 || status.CompletedApprovals != 1 || len(status.RequiredGroups) != 2 {
 		t.Fatalf("review obligations changed after submission: status=%+v err=%v", status, err)
+	}
+	snapshots := map[int64]ReviewGroup{}
+	for _, group := range status.RequiredGroups {
+		snapshots[group.GroupID] = group
+	}
+	if snapshots[f.group1].LeaderUserID != f.user1 || snapshots[f.group2].LeaderUserID != f.user2 ||
+		snapshots[f.group1].Decision != "approved" || snapshots[f.group2].Decision != "pending" {
+		t.Fatalf("review group snapshot changed or is incomplete: %+v", status.RequiredGroups)
 	}
 	_, complete, err = f.svc.Approve(ctx, f.user2, v.ID, f.group2)
 	if err != nil || !complete {
@@ -330,6 +344,10 @@ func TestSubmitJobRejectsOutOfOrderMigration(t *testing.T) {
 	if _, _, err = f.svc.Approve(ctx, f.user1, v.ID, f.group1); err != nil {
 		t.Fatal(err)
 	}
+	operations, err := f.svc.ExecutionOperations(ctx, f.user1, d.ID)
+	if err != nil || operations.Apply.Available || operations.Apply.Reason == "" {
+		t.Fatalf("out-of-order migration should not be advertised as executable: operations=%+v err=%v", operations, err)
+	}
 	if _, err = f.svc.SubmitJob(ctx, f.user1, d.ID); !errors.Is(err, ErrMigrationOrderInvalid) {
 		t.Fatalf("want migration order error, got %v", err)
 	}
@@ -339,10 +357,18 @@ func TestRollbackAndForwardJobsUseApprovedImmutableSnapshot(t *testing.T) {
 	f := workflowSetup(t, false)
 	d, revision := approveMigration(t, f, "rollback-forward", false)
 	recordWorkerHistory(t, f, d, revision, worker.Apply, "apply-original", "")
+	operations, err := f.svc.ExecutionOperations(context.Background(), f.user1, d.ID)
+	if err != nil || operations.Apply.Available || !operations.Rollback.Available || operations.Forward.Available {
+		t.Fatalf("operations after apply=%+v err=%v", operations, err)
+	}
 
 	rollback, err := f.svc.SubmitRollbackJob(context.Background(), f.user1, d.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	operations, err = f.svc.ExecutionOperations(context.Background(), f.user1, d.ID)
+	if err != nil || operations.ActiveJob == nil || operations.ActiveJob.JobID != rollback.ID || operations.Rollback.Available {
+		t.Fatalf("queued operation should be exposed and suppress duplicates: operations=%+v err=%v", operations, err)
 	}
 	if rollback.Operation != worker.Rollback || rollback.SQL != revision.UpSQL || rollback.ReverseSQL != revision.DownSQL || rollback.SourceExecutionID != "apply-original" || rollback.ExecutionID == "apply-original" {
 		t.Fatalf("rollback snapshot/source is wrong: %+v", rollback)
@@ -357,6 +383,10 @@ func TestRollbackAndForwardJobsUseApprovedImmutableSnapshot(t *testing.T) {
 	_, err = f.db.Exec(`UPDATE migration_jobs SET status = 'success', finished_at = NOW() WHERE id = $1`, rollback.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	operations, err = f.svc.ExecutionOperations(context.Background(), f.user1, d.ID)
+	if err != nil || operations.Apply.Available || !operations.Forward.Available || operations.Rollback.Available {
+		t.Fatalf("operations after rollback=%+v err=%v", operations, err)
 	}
 	forward, err := f.svc.SubmitForwardJob(context.Background(), f.user1, d.ID)
 	if err != nil {
@@ -384,6 +414,10 @@ func TestRollbackRejectsIrreversibleMigration(t *testing.T) {
 	recordWorkerHistory(t, f, d, revision, worker.Apply, "irreversible-apply", "")
 	if _, err := f.svc.SubmitRollbackJob(context.Background(), f.user1, d.ID); !errors.Is(err, ErrIrreversibleRollback) {
 		t.Fatalf("want irreversible rollback rejection, got %v", err)
+	}
+	operations, err := f.svc.ExecutionOperations(context.Background(), f.user1, d.ID)
+	if err != nil || operations.Rollback.Available || operations.Rollback.Reason == "" {
+		t.Fatalf("irreversible migration should not advertise rollback: operations=%+v err=%v", operations, err)
 	}
 }
 

@@ -225,6 +225,7 @@ type fakeWorkflow struct {
 	rejectErr        error
 	job              worker.Job
 	submitJobErr     error
+	operations       migration.MigrationOperations
 }
 
 func (f *fakeWorkflow) CreateMigration(_ context.Context, userID, databaseID int64, in migration.RevisionInput) (migration.MigrationDefinition, migration.MigrationRevision, error) {
@@ -289,6 +290,9 @@ func (f *fakeWorkflow) SubmitRollbackJob(ctx context.Context, userID, definition
 }
 func (f *fakeWorkflow) SubmitForwardJob(ctx context.Context, userID, definitionID int64) (worker.Job, error) {
 	return f.SubmitJob(ctx, userID, definitionID)
+}
+func (f *fakeWorkflow) ExecutionOperations(context.Context, int64, int64) (migration.MigrationOperations, error) {
+	return f.operations, nil
 }
 
 func (m *recordingMigrations) History(ctx context.Context, u, d int64, page, pageSize int) ([]web.MigrationRecord, int, error) {

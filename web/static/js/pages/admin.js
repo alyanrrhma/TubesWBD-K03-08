@@ -24,9 +24,10 @@ export async function adminPage(root,shell,user) {
       </section>
       <section id="groups"><h2>Group</h2>
         <form id="create-group" class="inline-form"><label>Nama group<input name="name" required maxlength="64"></label><button class="btn">Buat group</button></form>
-        <div class="table-wrap"><table><thead><tr><th>Nama</th><th>Anggota</th></tr></thead><tbody>
-        ${groups.map(g=>`<tr><td>${escapeHTML(g.Name)}</td><td>${g.MemberCount}</td></tr>`).join("")}
+        <div class="table-wrap"><table><thead><tr><th>Nama</th><th>Anggota</th><th>Approval</th></tr></thead><tbody>
+        ${groups.map(g=>`<tr><td>${escapeHTML(g.Name)}</td><td data-group-count="${g.ID}">${g.MemberCount}</td><td><button class="btn btn-secondary" type="button" data-manage-group="${g.ID}">Atur group</button></td></tr>`).join("")}
         </tbody></table></div>
+        <div id="group-details" class="notice" aria-live="polite">Pilih group untuk melihat dan mengatur leader approval.</div>
       </section>
       <section id="connections"><h2>Koneksi database</h2>
         <form id="create-connection" class="inline-form connection-form">
@@ -40,6 +41,102 @@ export async function adminPage(root,shell,user) {
         ${connections.map(c=>`<tr><td>${escapeHTML(c.Name)}</td><td>${escapeHTML(c.Host)}:${c.Port}</td><td>${escapeHTML(c.Database)}</td><td>${c.Active?"Aktif":"Tidak aktif"}</td><td><button class="btn-danger" data-delete-connection="${c.ID}">Hapus</button></td></tr>`).join("")}
         </tbody></table></div>
       </section>`);
+    const groupDetails = root.querySelector("#group-details");
+    let activeGroupRequest = 0;
+    async function showGroupDetails(groupID, message = "") {
+      const requestID = ++activeGroupRequest;
+      groupDetails.textContent = "Memuat anggota dan leader group…";
+      try {
+        const [detail, leaderResponse] = await Promise.all([
+          request(`/api/admin/groups/${groupID}`),
+          request(`/api/groups/${groupID}/leader`),
+        ]);
+        if (requestID !== activeGroupRequest) return;
+        const group = detail.group;
+        const members = detail.members || [];
+        const candidates = detail.candidates || [];
+        const countCell = root.querySelector(`[data-group-count="${groupID}"]`);
+        if (countCell) countCell.textContent = group.MemberCount;
+        const leaderID = leaderResponse.leader?.leader_user_id;
+        const leader = members.find(member => member.ID === leaderID);
+        groupDetails.className = "notice";
+        groupDetails.removeAttribute("role");
+        groupDetails.innerHTML = `
+          <h3>${escapeHTML(group.Name)} — leader approval</h3>
+          ${message ? `<p role="status">${escapeHTML(message)}</p>` : ""}
+          <p>${leaderID == null
+            ? "Belum ada leader. Migration yang memakai group ini belum dapat diajukan untuk review."
+            : `Leader saat ini: ${escapeHTML(leader?.Username || `User ID ${leaderID}`)}`}</p>
+          <h4>Anggota group</h4>
+          ${members.length
+            ? `<ul>${members.map(member => `<li>${escapeHTML(member.Username)}${member.ID === leaderID ? " — leader approval" : ""}</li>`).join("")}</ul>`
+            : "<p>Belum ada anggota group.</p>"}
+          ${candidates.length ? `
+            <form id="group-member-form" class="inline-form">
+              <label for="group-member">Tambahkan pengguna</label>
+              <select id="group-member" name="user_id" required>
+                ${candidates.map(candidate => `<option value="${candidate.ID}">${escapeHTML(candidate.Username)}</option>`).join("")}
+              </select>
+              <button class="btn" type="submit">Tambahkan anggota</button>
+            </form>` : "<p class=\"muted\">Semua pengguna sudah menjadi anggota group ini.</p>"}</p>
+          ${members.length ? `
+            <form id="group-leader-form" class="inline-form">
+              <label for="group-leader">Pilih leader dari anggota group</label>
+              <select id="group-leader" name="user_id" required>
+                ${members.map(member => `<option value="${member.ID}" ${member.ID === leaderID ? "selected" : ""}>${escapeHTML(member.Username)}</option>`).join("")}
+              </select>
+              <button class="btn" type="submit">${leaderID == null ? "Tetapkan leader" : "Simpan leader"}</button>
+            </form>` : `<p>Group ini belum memiliki anggota untuk dijadikan leader.</p>`}
+          <p class="muted">Perubahan leader hanya berlaku untuk review baru. Review yang sedang berjalan memakai snapshot leader saat diajukan.</p>`;
+        const memberForm = groupDetails.querySelector("#group-member-form");
+        if (memberForm) {
+          memberForm.addEventListener("submit", async event => {
+            event.preventDefault();
+            const userID = Number(new FormData(memberForm).get("user_id"));
+            const submit = memberForm.querySelector("button");
+            submit.disabled = true;
+            try {
+              await request(`/api/admin/groups/${groupID}/members`, {
+                method: "POST",
+                body: { user_id: userID },
+              });
+              await showGroupDetails(groupID, "Anggota group berhasil ditambahkan.");
+            } catch (error) {
+              groupDetails.insertAdjacentHTML("afterbegin", `<p class="flash flash-error" role="alert">${escapeHTML(error.message)}</p>`);
+              submit.disabled = false;
+            }
+          });
+        }
+        const form = groupDetails.querySelector("#group-leader-form");
+        if (form) {
+          form.addEventListener("submit", async event => {
+            event.preventDefault();
+            const userID = Number(new FormData(form).get("user_id"));
+            if (leaderID != null && userID !== leaderID && !confirm("Ganti leader group ini? Review yang sedang berjalan tidak akan berubah.")) return;
+            const submit = form.querySelector("button");
+            submit.disabled = true;
+            try {
+              await request(`/api/admin/groups/${groupID}/leader`, {
+                method: "PUT",
+                body: { user_id: userID },
+              });
+              await showGroupDetails(groupID, "Leader approval berhasil diperbarui.");
+            } catch (error) {
+              groupDetails.insertAdjacentHTML("afterbegin", `<p class="flash flash-error" role="alert">${escapeHTML(error.message)}</p>`);
+              submit.disabled = false;
+            }
+          });
+        }
+      } catch (error) {
+        if (requestID !== activeGroupRequest) return;
+        groupDetails.className = "flash flash-error";
+        groupDetails.setAttribute("role", "alert");
+        groupDetails.textContent = error.message;
+      }
+    }
+    root.querySelectorAll("[data-manage-group]").forEach(button => button.addEventListener("click", () => {
+      showGroupDetails(button.dataset.manageGroup);
+    }));
     root.querySelector("#create-user").addEventListener("submit",async e=>{
       e.preventDefault();const f=e.currentTarget;const data=Object.fromEntries(new FormData(f));data.is_platform_admin=f.elements.is_platform_admin.checked;
       try{await request("/api/admin/users",{method:"POST",body:data});await draw("Pengguna berhasil dibuat.");}catch(err){alert(err.message);}
