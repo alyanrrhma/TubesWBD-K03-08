@@ -1,11 +1,21 @@
 # TubesWBD-K03-08 — Database Management Platform (DBMP)
 
-> Tugas Besar **IF3110 Pengembangan Aplikasi Web 2026 — Milestone 1** (kelompok K03-08).
-> Fondasi Database Management Platform: pengaturan akses, penjelajahan database, dan pencatatan perubahan schema secara terkontrol.
+> Tugas Besar **IF3110 Pengembangan Aplikasi Web 2026 — Milestone 2** (kelompok K03-08).
+> Database Management Platform dengan SPA, workflow migration, approval, asynchronous worker, batch processing, dan riwayat eksekusi.
 
 Aplikasi web untuk mengelola dan menjelajahi banyak database **PostgreSQL** dari satu tempat. Platform Admin mendaftarkan koneksi database target, mengelompokkan pengguna ke dalam *group*, lalu memberi group tersebut akses **View Only** atau **View + Edit** ke database tertentu. Pengguna biasa dapat menjelajahi schema, tabel, struktur, dan isi data, serta (bila punya akses *View + Edit*) menjalankan **migration SQL** yang tercatat riwayatnya.
 
-Dibangun dengan Go (standard library `net/http`), server-side rendering memakai `html/template`, dan driver `pgx`. Seluruh template dan file statis ditanam ke dalam binary lewat `go:embed`.
+Dibangun dengan Go (`net/http`) dan driver `pgx`. Frontend Milestone 2 adalah SPA berbasis JavaScript tanpa framework; server menyajikan app shell dan API JSON. File statis ditanam ke dalam binary lewat `go:embed`.
+
+## Milestone 2: workflow dan batas verifikasi
+
+- Draft migration disimpan sebagai revisi immutable. Pengajuan apply menunggu keputusan setiap leader group yang memiliki akses ke database.
+- Apply, rollback, dan forward masuk ke `migration_jobs` dan dijalankan oleh worker Go. Rollback/forward memakai review operasi tersendiri; SQL yang dijalankan berasal dari snapshot revisi sumber.
+- `migration_job_attempts` merekam setiap percobaan worker beserta SQL, status, error, SQLSTATE, dan apakah SQL target sudah dikirim. `migration_worker_history` menyimpan hasil yang ter-commit. Endpoint execution history menggabungkan attempt worker dan `migration_history` Milestone 1 tanpa menimpa catatan lama.
+- Checkbox **Hide rollback** menyaring execution sumber dan rollback sukses berdasarkan execution ID; attempt gagal, rollback gagal, dan forward tetap terlihat.
+- Batch menggunakan cursor ID dan transaksi per batch. Bukti batch/checkpoint berada di database target; kompensasi menjalankan down SQL terbalik dari batch terakhir yang committed. Platform menyimpan ID/checkpoint, bukan before-image row. Penulis migration harus memastikan down SQL benar-benar memulihkan data yang diubah; operasi yang tidak dapat dipulihkan dengan aman harus ditandai irreversible. Partial hanya dilanjutkan melalui aksi resume eksplisit.
+- Structured log memakai `slog` JSON ke stdout. Viewer SQL, SQL migration, batch, retry, commit, dan rollback memiliki log. Tracing memakai propagasi W3C dan ekspor OTLP/HTTP opsional melalui `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`.
+- Suite Go, integrasi PostgreSQL, browser Playwright tiga viewport, benchmark, dan penerimaan span oleh OpenTelemetry Collector sudah dijalankan; lihat hasil serta perintahnya di [Pengujian Milestone 2](#pengujian-milestone-2).
 
 ---
 
@@ -50,9 +60,9 @@ Dibangun dengan Go (standard library `net/http`), server-side rendering memakai 
 - Halaman data tabel dengan pagination (50 baris per halaman), penanda `NULL`, dan pembacaan lewat transaksi *read-only*.
 
 **Migration**
-- Pengguna dengan akses *View + Edit* dapat menjalankan SQL pada database target dalam satu transaksi: *commit* bila berhasil, *rollback* bila gagal.
-- Setiap eksekusi (berhasil maupun gagal) tercatat sebagai versi berurutan per database: pelaksana, waktu, status, SQL, dan pesan error.
-- Pengguna dengan akses *View Only* dapat melihat riwayat dan detail migration, tetapi tidak dapat menjalankannya.
+- Workflow draft, immutable revisions, approval multi-group, asynchronous queue/worker, rollback/forward dengan approval baru, retry terbatas, checkpoint batch, dan execution history append-only.
+- SQL migration biasa berjalan di worker dalam satu transaksi; mode batch memakai transaksi per batch dan menyediakan status/progress serta resume eksplisit.
+- Pengguna dengan akses *View Only* dapat melihat riwayat; perubahan membutuhkan akses *View + Edit* dan approval setiap group yang berhak.
 
 ---
 
@@ -69,7 +79,7 @@ Spesifikasi menetapkan alur minimum: *Login → Access Control → Select Databa
 | Create Migration | Editor SQL di `/databases/{id}/migrations`, hanya tampil untuk akses View + Edit |
 | Execute | `POST /databases/{id}/migrations` (otorisasi View + Edit diperiksa di backend sebelum SQL divalidasi) |
 | Commit/Rollback | `applyInTx`: `COMMIT` bila seluruh SQL berhasil, `ROLLBACK` bila gagal |
-| Update Migration History | Baris baru pada `migration_history` (status `SUCCESS` atau `FAILED`) dengan nomor versi berikutnya |
+| Update Migration History | Attempt worker append-only di `migration_job_attempts`; hasil committed juga dicatat dalam `migration_worker_history` |
 
 ---
 
@@ -109,7 +119,7 @@ Konfigurasi dinyatakan tidak valid bila grace period tidak lebih kecil dari rota
 | Ketentuan | Status | Keterangan |
 | --- | :---: | --- |
 | Backend menggunakan Go | ✔ | Go 1.25, `net/http` |
-| Frontend bukan SPA (Go template) | ✔ | `html/template` dengan server-side rendering |
+| SPA Milestone 2 | ✔ | `web/static/js`, router client-side dan API JSON |
 | Database target PostgreSQL | ✔ | Driver `pgx/v5` |
 | Unit test dan integration test | ✔ | Lihat [Pengujian](#pengujian) |
 
@@ -158,12 +168,13 @@ Konfigurasi dinyatakan tidak valid bila grace period tidak lebih kecil dari rota
 | Kebutuhan | Implementasi |
 | --- | --- |
 | Migration query viewer/editor | Editor SQL pada halaman Migration; SQL yang gagal dipertahankan di editor agar dapat diperbaiki |
-| Buat dan jalankan migration hanya oleh View + Edit | Otorisasi `CanEdit` diperiksa di backend sebelum validasi SQL; View Only menerima `403` bila memanggil endpoint langsung |
+| Buat dan jalankan migration hanya oleh View + Edit | Otorisasi backend, workflow review, semua leader group approve, lalu job worker |
 | View Only hanya melihat riwayat dan detail | Halaman riwayat dan detail terbuka untuk View Only; editor tidak ditampilkan |
-| Riwayat migration linear per database | Nomor versi berurutan per database (`MAX(version) + 1`), unik pada `(database_id, version)`, dan dijalankan satu per satu per database |
-| Pencatatan versi, SQL, pelaksana, waktu, dan status | Tabel `migration_history` |
-| Transaction: commit bila berhasil, rollback bila gagal | `applyInTx` pada database target |
-| Tampilan riwayat perubahan | Daftar riwayat berpagination dan halaman detail per versi |
+| Workflow migration | Revisi immutable, approval multi-group, antrean asynchronous dan worker revalidation |
+| SQL biasa dan batch | Transaksi tunggal untuk mode normal; cursor dan transaksi per batch untuk mode batch |
+| Rollback/forward | Operasi baru dengan approval baru; rollback memakai down SQL revision yang dieksekusi |
+| Riwayat attempt | Endpoint `execution-history` menggabungkan riwayat lama dan attempt worker, termasuk SQL/error/SQLSTATE |
+| Hide rollback | Filter UI dan backend berdasarkan source execution ID; failed attempts dipertahankan |
 
 ### Fitur bonus
 
@@ -295,7 +306,11 @@ Skema dibuat otomatis saat aplikasi start (idempotent, dilindungi *advisory lock
 | `user_groups` | Relasi pengguna ↔ group |
 | `database_connections` | Koneksi database target: `name`, `host`, `port`, `database_name`, `username`, `ssl_mode`, `password_encrypted` |
 | `group_database_access` | Level akses group ke database: `VIEW_ONLY` atau `VIEW_EDIT` |
-| `migration_history` | Riwayat migration per database: `version`, `sql_text`, `executed_by`, `executed_at`, `status` (`SUCCESS`/`FAILED`), `error_message` |
+| `migration_history` | Riwayat append-only Milestone 1 yang tetap tersedia untuk backward compatibility |
+| `migration_jobs` | Job asynchronous, snapshot SQL, status, retry, lease/heartbeat, dan checkpoint progress |
+| `migration_job_attempts` | Setiap attempt worker beserta SQL, status, error, SQLSTATE, dan sql_started |
+| `migration_worker_history` | Eksekusi worker yang sudah committed, dengan execution/source IDs dan SQL aktual |
+| `migration_operation_reviews` | Approval baru dan snapshot rollback/forward |
 | `sessions` | Sesi: hash token saat ini dan sebelumnya, hash CSRF, waktu, status cabut |
 | `platform_schema_migrations` | Pencatat file di `internal/platformdb/migrations/` yang sudah diterapkan |
 
@@ -465,6 +480,53 @@ Untuk production: set `APP_ENV=production`, isi `APP_SECRET_KEY`, dan layani apl
 ```bash
 go test ./...
 ```
+
+### Pengujian Milestone 2
+
+Unit tests yang dapat berjalan tanpa PostgreSQL memeriksa klasifikasi retry, filter Hide rollback, trace propagation, dan atribut JSON SQL audit. Integration tests di `internal/migration` dan `internal/worker` memakai PostgreSQL nyata dan **skip** bila DSN tidak diatur. Gunakan database khusus berakhiran `_test`:
+
+```bash
+TEST_PLATFORM_DATABASE_URL='postgres://.../dbmp_platform_test' \
+TEST_TARGET_DATABASE_URL='postgres://.../dbmp_target_test' \
+go test ./internal/migration ./internal/worker ./tests/integration
+```
+
+Benchmark dataset yang sama untuk UPDATE penuh dan cursor batch (perlu database target uji berakhiran `_test`):
+
+```bash
+BENCHMARK_DATABASE_URL='postgres://.../dbmp_target_test' \
+go run ./cmd/benchmark-batch -rows 2000000 -batch-size 20000
+```
+
+Benchmark menolak hasil jika UPDATE non-batch tidak melewati satu detik atau jumlah row hasil kedua cara tidak sama. Pengukuran aktual pada PostgreSQL 16.15 dalam container lokal, 27 November 2026:
+
+| Row | Non-batch | Batch size | Jumlah batch | Batch total | Row diverifikasi |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2.000.000 | 5,023 s | 20.000 | 100 | 9,894 s | 2.000.000 pada kedua cara |
+
+Dataset yang sama dipakai pada kedua cara; hasil benchmark ini mengukur waktu dinding pada container uji dan bukan klaim bahwa batching selalu lebih cepat.
+
+Browser test Playwright menggunakan tiga proyek viewport dan memeriksa login, dashboard, navigasi halaman administrasi, overflow, serta alur migration → approval API → worker → execution history → Hide rollback → viewer. Approval workflow dalam skenario ini dibuat melalui API; interaksi seluruh modal/form/editor dan setiap halaman Milestone 1 belum tercakup otomatis. Untuk alur migration/viewer, sediakan target PostgreSQL khusus test:
+
+```bash
+npm install
+npx playwright install chromium
+BROWSER_BASE_URL=http://127.0.0.1:8080 \
+BROWSER_USERNAME=qa-admin BROWSER_PASSWORD='...' BROWSER_IS_ADMIN=true \
+npm run test:browser
+```
+
+Jalankan server lebih dulu dengan database platform khusus test. `BROWSER_TARGET_DATABASE` memilih nama database target yang sudah terdaftar di server; username, password, host, dan port target dapat diatur melalui `BROWSER_TARGET_USER`, `BROWSER_TARGET_PASSWORD`, `BROWSER_TARGET_HOST`, dan `BROWSER_TARGET_PORT`. Akun browser harus memiliki akses ke target itu. Jangan memakai akun production.
+
+OpenTelemetry Collector lokal dapat menerima OTLP/HTTP pada port 4318 memakai konfigurasi `tests/otel/collector.yaml`. Dengan server berjalan memakai `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces`, alur browser menghasilkan span API enqueue, claim queue, dan worker dalam trace yang sama.
+
+Contoh struktur output JSON `slog` untuk query (durasi, jumlah row, dan SQLSTATE aktual bergantung eksekusi):
+
+```json
+{"time":"<RFC3339>","level":"INFO","msg":"sql_query_finished","actor":7,"database":3,"query":"SELECT ...","parameters":[],"duration":"<duration>","row_count":50,"status":"success","trace_id":"<trace-id>","span_id":"<span-id>"}
+```
+
+Span diekspor dalam OTLP/HTTP JSON ke endpoint traces yang dikonfigurasi, atau dicatat sebagai event `otel_span` jika endpoint tidak diatur. Span names yang digunakan meliputi `api.migration.enqueue`, `worker.queue.claim`, `worker.migration`, `worker.database.lock.acquire`, `db.migration.batch`, dan `db.transaction.commit`. Pada verifikasi lokal, collector menerima `api.migration.enqueue`, `worker.queue.claim`, dan `worker.migration` dengan trace ID yang sama dan parent-child relationship lintas API/worker.
 
 Spesifikasi mewajibkan automated testing untuk fitur backend, mencakup alur berhasil, kegagalan, dan penolakan akses. Tes dikelompokkan menjadi dua jenis.
 
