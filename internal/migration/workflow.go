@@ -2,11 +2,15 @@ package migration
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 type WorkflowStatus string
@@ -102,12 +106,13 @@ type WorkflowRepository struct{ DB *sql.DB }
 
 // WorkflowService applies authorization and workflow rules over the repository.
 type WorkflowService struct {
-	Repo  WorkflowRepository
-	Authz Authorizer
+	Repo        WorkflowRepository
+	Authz       Authorizer
+	Revalidator *Revalidator
 }
 
 func NewWorkflowService(db *sql.DB, authz Authorizer) *WorkflowService {
-	return &WorkflowService{Repo: WorkflowRepository{DB: db}, Authz: authz}
+	return &WorkflowService{Repo: WorkflowRepository{DB: db}, Authz: authz, Revalidator: NewRevalidator(db, authz)}
 }
 
 func validateRevisionInput(in RevisionInput) error {
@@ -273,6 +278,110 @@ func (s *WorkflowService) ApproveForDefinition(ctx context.Context, userID, defi
 	return s.Repo.Approve(ctx, userID, v.ID, groupID)
 }
 
+// SubmitJob snapshots the latest approved revision and publishes it through
+// the existing durable worker queue. The advisory lock serializes API
+// submissions so two requests cannot both pass duplicate-job validation.
+func (s *WorkflowService) SubmitJob(ctx context.Context, userID, definitionID int64) (worker.Job, error) {
+	d, err := s.Repo.GetDefinition(ctx, definitionID)
+	if err != nil {
+		return worker.Job{}, err
+	}
+	if err = s.canEdit(ctx, userID, d.DatabaseID); err != nil {
+		return worker.Job{}, err
+	}
+	revision, err := s.Repo.ApprovedRevision(ctx, definitionID)
+	if err != nil {
+		return worker.Job{}, err
+	}
+	executionID, err := newExecutionID()
+	if err != nil {
+		return worker.Job{}, fmt.Errorf("create execution ID: %w", err)
+	}
+	job := worker.Job{ExecutionID: executionID, DatabaseID: d.DatabaseID, MigrationID: d.ID, Revision: revision.Revision, ActorID: userID,
+		Operation: worker.Apply, Mode: worker.Normal, SQL: revision.UpSQL, ReverseSQL: revision.DownSQL}
+	return s.enqueueApprovedOperation(ctx, job)
+}
+
+// SubmitRollbackJob queues the down SQL of the latest approved revision. The
+// active source execution is derived from append-only worker history.
+func (s *WorkflowService) SubmitRollbackJob(ctx context.Context, userID, definitionID int64) (worker.Job, error) {
+	return s.submitHistoryOperation(ctx, userID, definitionID, worker.Rollback)
+}
+
+// SubmitForwardJob queues the up SQL of the same approved revision after its
+// latest successful state transition was a rollback.
+func (s *WorkflowService) SubmitForwardJob(ctx context.Context, userID, definitionID int64) (worker.Job, error) {
+	return s.submitHistoryOperation(ctx, userID, definitionID, worker.Forward)
+}
+
+func (s *WorkflowService) submitHistoryOperation(ctx context.Context, userID, definitionID int64, operation worker.Operation) (worker.Job, error) {
+	d, err := s.Repo.GetDefinition(ctx, definitionID)
+	if err != nil {
+		return worker.Job{}, err
+	}
+	if err = s.canEdit(ctx, userID, d.DatabaseID); err != nil {
+		return worker.Job{}, err
+	}
+	var sourceExecutionID string
+	var revisionNumber int64
+	query := `SELECT execution_id,revision FROM migration_worker_history WHERE migration_id=$1 AND operation IN ('apply','forward') ORDER BY committed_at DESC,execution_id DESC LIMIT 1`
+	if operation == worker.Forward {
+		query = `SELECT execution_id,revision FROM migration_worker_history WHERE migration_id=$1 AND operation='rollback' ORDER BY committed_at DESC,execution_id DESC LIMIT 1`
+	}
+	err = s.Repo.DB.QueryRowContext(ctx, query, definitionID).Scan(&sourceExecutionID, &revisionNumber)
+	if errors.Is(err, sql.ErrNoRows) {
+		if operation == worker.Forward {
+			return worker.Job{}, ErrForwardUnavailable
+		}
+		return worker.Job{}, ErrRollbackUnavailable
+	}
+	if err != nil {
+		return worker.Job{}, fmt.Errorf("load migration source execution: %w", err)
+	}
+	revision, err := s.Repo.GetRevision(ctx, definitionID, revisionNumber)
+	if err != nil {
+		return worker.Job{}, err
+	}
+	executionID, err := newExecutionID()
+	if err != nil {
+		return worker.Job{}, fmt.Errorf("create execution ID: %w", err)
+	}
+	job := worker.Job{ExecutionID: executionID, DatabaseID: d.DatabaseID, MigrationID: d.ID, Revision: revision.Revision, ActorID: userID,
+		Operation: operation, Mode: worker.Normal, SQL: revision.UpSQL, ReverseSQL: revision.DownSQL, SourceExecutionID: sourceExecutionID}
+	return s.enqueueApprovedOperation(ctx, job)
+}
+
+func (s *WorkflowService) enqueueApprovedOperation(ctx context.Context, job worker.Job) (worker.Job, error) {
+	if s.Revalidator == nil {
+		return worker.Job{}, worker.ErrUnapproved
+	}
+	conn, err := s.Repo.DB.Conn(ctx)
+	if err != nil {
+		return worker.Job{}, fmt.Errorf("lock job submission: %w", err)
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationSubmitLockID); err != nil {
+		return worker.Job{}, fmt.Errorf("lock job submission: %w", err)
+	}
+	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationSubmitLockID)
+	if err = s.Revalidator.Revalidate(ctx, job); err != nil {
+		return worker.Job{}, err
+	}
+	queued, err := worker.Enqueue(ctx, s.Repo.DB, job)
+	if err != nil {
+		return worker.Job{}, fmt.Errorf("publish migration job: %w", err)
+	}
+	return queued, nil
+}
+
+func newExecutionID() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes[:]), nil
+}
+
 func (s *WorkflowService) RejectForDefinition(ctx context.Context, userID, definitionID, revisionNumber, groupID int64) (Approval, error) {
 	if userID <= 0 || definitionID <= 0 || revisionNumber <= 0 || groupID <= 0 {
 		return Approval{}, ErrInvalidArgument
@@ -335,7 +444,9 @@ func (r WorkflowRepository) Create(ctx context.Context, userID, databaseID int64
 
 func (r WorkflowRepository) GetDefinition(ctx context.Context, id int64) (MigrationDefinition, error) {
 	var d MigrationDefinition
-	err := r.DB.QueryRowContext(ctx, `SELECT d.id,d.database_id,d.name,d.description,d.created_by,d.workflow_status,d.created_at,d.updated_at,
+	err := r.DB.QueryRowContext(ctx, `SELECT d.id,d.database_id,d.name,d.description,d.created_by,
+		CASE WHEN EXISTS(SELECT 1 FROM migration_worker_history h WHERE h.migration_id=d.id) THEN 'executed' ELSE d.workflow_status END,
+		d.created_at,d.updated_at,
 		COALESCE((SELECT MAX(revision) FROM migration_revisions WHERE definition_id=d.id),0)
 		FROM migration_definitions d WHERE d.id=$1`, id).
 		Scan(&d.ID, &d.DatabaseID, &d.Name, &d.Description, &d.CreatedBy, &d.WorkflowStatus, &d.CreatedAt, &d.UpdatedAt, &d.Revision)
@@ -393,7 +504,8 @@ func (r WorkflowRepository) GetRevision(ctx context.Context, definitionID, revis
 
 func (r WorkflowRepository) ReviewStatus(ctx context.Context, definitionID int64) (ReviewStatus, error) {
 	var s ReviewStatus
-	err := r.DB.QueryRowContext(ctx, `SELECT d.id,r.id,r.revision,r.workflow_status,
+	err := r.DB.QueryRowContext(ctx, `SELECT d.id,r.id,r.revision,
+		CASE WHEN EXISTS(SELECT 1 FROM migration_worker_history h WHERE h.migration_id=d.id) THEN 'executed' ELSE r.workflow_status END,
 		(SELECT COUNT(*) FROM migration_review_groups rg WHERE rg.revision_id=r.id),
 		(SELECT COUNT(*) FROM migration_review_groups rg JOIN migration_approvals a ON a.revision_id=rg.revision_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='approved' WHERE rg.revision_id=r.id),
 		(SELECT COUNT(*) FROM migration_review_groups rg JOIN migration_approvals a ON a.revision_id=rg.revision_id AND a.group_id=rg.group_id AND a.user_id=rg.leader_user_id AND a.decision='rejected' WHERE rg.revision_id=r.id),
@@ -449,12 +561,22 @@ func (r WorkflowRepository) AppendRevision(ctx context.Context, userID, definiti
 		return MigrationRevision{}, err
 	}
 	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationSubmitLockID); err != nil {
+		return MigrationRevision{}, fmt.Errorf("lock migration update: %w", err)
+	}
 	var dID int64
 	if err = tx.QueryRowContext(ctx, `SELECT id FROM migration_definitions WHERE id=$1 FOR UPDATE`, definitionID).Scan(&dID); errors.Is(err, sql.ErrNoRows) {
 		return MigrationRevision{}, ErrWorkflowNotFound
 	}
 	if err != nil {
 		return MigrationRevision{}, err
+	}
+	var activeJob bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_jobs WHERE migration_id=$1 AND status IN ('pending','running','retrying','partial','partially_reverted','uncertain'))`, definitionID).Scan(&activeJob); err != nil {
+		return MigrationRevision{}, err
+	}
+	if activeJob {
+		return MigrationRevision{}, ErrExecutionAlreadyQueued
 	}
 	var rev int64
 	var latestStatus WorkflowStatus
@@ -698,6 +820,13 @@ func (r WorkflowRepository) ApprovedRevision(ctx context.Context, definitionID i
 	}
 	if v.WorkflowStatus != WorkflowApproved {
 		return v, ErrApprovalIncomplete
+	}
+	var executed bool
+	if err = r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_worker_history WHERE migration_id=$1)`, definitionID).Scan(&executed); err != nil {
+		return v, err
+	}
+	if executed {
+		return v, ErrMigrationAlreadyExecuted
 	}
 	var complete bool
 	err = r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migration_review_groups WHERE revision_id=$1)

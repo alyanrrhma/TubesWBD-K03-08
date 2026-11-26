@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 func TestValidateRevisionInput(t *testing.T) {
@@ -34,5 +36,12 @@ func TestWorkflowReadDeniesUserWithoutAccessBeforeRepository(t *testing.T) {
 	s := NewWorkflowService(nil, fakeAuthz{})
 	if _, err := s.ListMigrations(context.Background(), 10, 20); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("want ErrForbidden, got %v", err)
+	}
+}
+
+func TestRevalidatorFailsClosedWithoutDependencies(t *testing.T) {
+	var v *Revalidator
+	if err := v.Revalidate(context.Background(), worker.Job{}); !errors.Is(err, worker.ErrUnapproved) {
+		t.Fatalf("want fail-closed error, got %v", err)
 	}
 }

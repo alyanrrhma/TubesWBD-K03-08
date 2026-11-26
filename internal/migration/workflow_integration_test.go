@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/platformdb"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 type workflowFixture struct {
@@ -64,6 +65,50 @@ func workflowSetup(t *testing.T, includeSecondGroup bool) workflowFixture {
 
 func validRevision(name string) RevisionInput {
 	return RevisionInput{Name: name, UpSQL: "CREATE TABLE sample(id BIGINT)", DownSQL: "DROP TABLE sample"}
+}
+
+func approveMigration(t *testing.T, f workflowFixture, name string, irreversible bool) (MigrationDefinition, MigrationRevision) {
+	t.Helper()
+	in := validRevision(name)
+	if irreversible {
+		in.Irreversible, in.DownSQL, in.IrreversibleReason = true, "", "cannot be reversed safely"
+	}
+	d, revision, err := f.svc.CreateMigration(context.Background(), f.user1, f.databaseID, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.svc.SubmitReview(context.Background(), f.user1, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = f.svc.Approve(context.Background(), f.user1, revision.ID, f.group1); err != nil {
+		t.Fatal(err)
+	}
+	return d, revision
+}
+
+func recordWorkerHistory(t *testing.T, f workflowFixture, d MigrationDefinition, revision MigrationRevision, operation worker.Operation, executionID, sourceExecutionID string) {
+	t.Helper()
+	jobID := "job-" + executionID
+	_, err := f.db.Exec(`INSERT INTO migration_jobs(id,execution_id,database_id,migration_id,revision,actor_id,operation,mode,sql_text,reverse_sql,source_execution_id,status)
+		VALUES($1,$2,$3,$4,$5,$6,$7,'normal',$8,$9,NULLIF($10,''),'success')`, jobID, executionID, f.databaseID, d.ID, revision.Revision, f.user1, operation, revision.UpSQL, nullableTestSQL(revision.DownSQL), sourceExecutionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statement := revision.UpSQL
+	if operation == worker.Rollback {
+		statement = revision.DownSQL
+	}
+	if _, err = f.db.Exec(`INSERT INTO migration_worker_history(execution_id,job_id,database_id,migration_id,revision,actor_id,operation,source_execution_id,sql_text)
+		VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9)`, executionID, jobID, f.databaseID, d.ID, revision.Revision, f.user1, operation, sourceExecutionID, statement); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func nullableTestSQL(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func TestWorkflowCreateAndUpdateMigration(t *testing.T) {
@@ -206,6 +251,161 @@ func TestWorkflowRejectRecordsLeaderAndMakesRevisionTerminal(t *testing.T) {
 	}
 	if _, _, err = f.svc.Approve(ctx, f.user1, v.ID, f.group1); !errors.Is(err, ErrWorkflowInvalid) {
 		t.Fatalf("want terminal workflow error, got %v", err)
+	}
+}
+
+func TestSubmitJobPublishesApprovedSQLSnapshot(t *testing.T) {
+	f := workflowSetup(t, false)
+	ctx := context.Background()
+	d, v, err := f.svc.CreateMigration(ctx, f.user1, f.databaseID, validRevision("submit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.svc.SubmitJob(ctx, f.user1, d.ID); !errors.Is(err, ErrApprovalIncomplete) {
+		t.Fatalf("unapproved migration was submitted: %v", err)
+	}
+	if _, err = f.svc.SubmitReview(ctx, f.user1, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = f.svc.Approve(ctx, f.user1, v.ID, f.group1); err != nil {
+		t.Fatal(err)
+	}
+	failedJob, enqueueErr := f.svc.SubmitJob(ctx, 999999, d.ID)
+	if enqueueErr == nil || failedJob.ID != "" || failedJob.ExecutionID != "" {
+		t.Fatalf("enqueue failure returned successful job: job=%+v err=%v", failedJob, enqueueErr)
+	}
+	var queuedCount int
+	if err = f.db.QueryRow(`SELECT count(*) FROM migration_jobs WHERE migration_id=$1`, d.ID).Scan(&queuedCount); err != nil || queuedCount != 0 {
+		t.Fatalf("failed enqueue persisted jobs=%d err=%v", queuedCount, err)
+	}
+	job, err := f.svc.SubmitJob(ctx, f.user1, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.ID == "" || len(job.ExecutionID) != 32 || job.Status != worker.Pending || job.SQL != v.UpSQL || job.ReverseSQL != v.DownSQL {
+		t.Fatalf("job snapshot=%+v", job)
+	}
+	var sqlText, reverseSQL string
+	if err = f.db.QueryRow(`SELECT sql_text,reverse_sql FROM migration_jobs WHERE id=$1`, job.ID).Scan(&sqlText, &reverseSQL); err != nil || sqlText != v.UpSQL || reverseSQL != v.DownSQL {
+		t.Fatalf("persisted SQL=%q reverse=%q err=%v", sqlText, reverseSQL, err)
+	}
+	if _, err = f.svc.SubmitJob(ctx, f.user1, d.ID); !errors.Is(err, ErrExecutionAlreadyQueued) {
+		t.Fatalf("want duplicate job rejection, got %v", err)
+	}
+	changed := job
+	changed.ID = "different-job"
+	changed.SQL += "; SELECT 1"
+	if err = f.svc.Revalidator.Revalidate(ctx, changed); !errors.Is(err, ErrJobSnapshotMismatch) {
+		t.Fatalf("want snapshot mismatch, got %v", err)
+	}
+	if _, err = f.db.Exec(`UPDATE migration_jobs SET status='running' WHERE id=$1`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	changed = job
+	changed.ID = "different-job"
+	if err = f.svc.Revalidator.Revalidate(ctx, changed); !errors.Is(err, ErrDatabaseExecutionBlocked) {
+		t.Fatalf("want blocked database error, got %v", err)
+	}
+	if _, err = f.db.Exec(`UPDATE migration_jobs SET status='success' WHERE id=$1`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.svc.Revalidator.Revalidate(ctx, job); !errors.Is(err, ErrMigrationAlreadyExecuted) {
+		t.Fatalf("want already executed error, got %v", err)
+	}
+}
+
+func TestSubmitJobRejectsOutOfOrderMigration(t *testing.T) {
+	f := workflowSetup(t, false)
+	ctx := context.Background()
+	if _, _, err := f.svc.CreateMigration(ctx, f.user1, f.databaseID, validRevision("first pending")); err != nil {
+		t.Fatal(err)
+	}
+	d, v, err := f.svc.CreateMigration(ctx, f.user1, f.databaseID, validRevision("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.svc.SubmitReview(ctx, f.user1, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = f.svc.Approve(ctx, f.user1, v.ID, f.group1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.svc.SubmitJob(ctx, f.user1, d.ID); !errors.Is(err, ErrMigrationOrderInvalid) {
+		t.Fatalf("want migration order error, got %v", err)
+	}
+}
+
+func TestRollbackAndForwardJobsUseApprovedImmutableSnapshot(t *testing.T) {
+	f := workflowSetup(t, false)
+	d, revision := approveMigration(t, f, "rollback-forward", false)
+	recordWorkerHistory(t, f, d, revision, worker.Apply, "apply-original", "")
+
+	rollback, err := f.svc.SubmitRollbackJob(context.Background(), f.user1, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rollback.Operation != worker.Rollback || rollback.SQL != revision.UpSQL || rollback.ReverseSQL != revision.DownSQL || rollback.SourceExecutionID != "apply-original" || rollback.ExecutionID == "apply-original" {
+		t.Fatalf("rollback snapshot/source is wrong: %+v", rollback)
+	}
+	var storedSource string
+	if err = f.db.QueryRow(`SELECT source_execution_id FROM migration_jobs WHERE id=$1`, rollback.ID).Scan(&storedSource); err != nil || storedSource != "apply-original" {
+		t.Fatalf("rollback source was not persisted: source=%q err=%v", storedSource, err)
+	}
+
+	recordWorkerHistory(t, f, d, revision, worker.Rollback, "rollback-done", "apply-original")
+	forward, err := f.svc.SubmitForwardJob(context.Background(), f.user1, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.Operation != worker.Forward || forward.SQL != revision.UpSQL || forward.ReverseSQL != revision.DownSQL || forward.SourceExecutionID != "rollback-done" || forward.ExecutionID == "rollback-done" {
+		t.Fatalf("forward snapshot/source is wrong: %+v", forward)
+	}
+}
+
+func TestRollbackRejectsMigrationThatIsNotLastActive(t *testing.T) {
+	f := workflowSetup(t, false)
+	first, firstRevision := approveMigration(t, f, "first-active", false)
+	second, secondRevision := approveMigration(t, f, "second-active", false)
+	recordWorkerHistory(t, f, first, firstRevision, worker.Apply, "first-apply", "")
+	recordWorkerHistory(t, f, second, secondRevision, worker.Apply, "second-apply", "")
+	if _, err := f.svc.SubmitRollbackJob(context.Background(), f.user1, first.ID); !errors.Is(err, ErrRollbackUnavailable) {
+		t.Fatalf("want rollback unavailable for non-last migration, got %v", err)
+	}
+}
+
+func TestRollbackRejectsIrreversibleMigration(t *testing.T) {
+	f := workflowSetup(t, false)
+	d, revision := approveMigration(t, f, "irreversible-active", true)
+	recordWorkerHistory(t, f, d, revision, worker.Apply, "irreversible-apply", "")
+	if _, err := f.svc.SubmitRollbackJob(context.Background(), f.user1, d.ID); !errors.Is(err, ErrIrreversibleRollback) {
+		t.Fatalf("want irreversible rollback rejection, got %v", err)
+	}
+}
+
+func TestRollbackRequiresRevisionApproval(t *testing.T) {
+	f := workflowSetup(t, false)
+	d, revision := approveMigration(t, f, "approval-required-for-rollback", false)
+	recordWorkerHistory(t, f, d, revision, worker.Apply, "approval-required-apply", "")
+	if _, err := f.db.Exec(`DELETE FROM migration_approvals WHERE revision_id=$1`, revision.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.svc.SubmitRollbackJob(context.Background(), f.user1, d.ID); !errors.Is(err, worker.ErrUnapproved) {
+		t.Fatalf("rollback without the immutable revision approval should fail, got %v", err)
+	}
+}
+
+func TestForwardRequiresSuccessfulRollbackAndApproval(t *testing.T) {
+	f := workflowSetup(t, false)
+	d, revision := approveMigration(t, f, "forward-state", false)
+	if _, err := f.svc.SubmitForwardJob(context.Background(), f.user1, d.ID); !errors.Is(err, ErrForwardUnavailable) {
+		t.Fatalf("forward without execution history should fail, got %v", err)
+	}
+	recordWorkerHistory(t, f, d, revision, worker.Apply, "forward-apply", "")
+	if _, err := f.svc.SubmitForwardJob(context.Background(), f.user1, d.ID); !errors.Is(err, ErrForwardUnavailable) {
+		t.Fatalf("forward without rollback should fail, got %v", err)
+	}
+	if _, err := f.db.Exec(`UPDATE migration_revisions SET workflow_status='draft',submitted_at=NULL WHERE id=$1`, revision.ID); err == nil {
+		t.Fatal("approved revision workflow was unexpectedly mutable")
 	}
 }
 
