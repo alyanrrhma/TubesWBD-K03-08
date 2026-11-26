@@ -297,8 +297,15 @@ func (s *WorkflowService) SubmitJob(ctx context.Context, userID, definitionID in
 	if err != nil {
 		return worker.Job{}, fmt.Errorf("create execution ID: %w", err)
 	}
+	mode, table, size, err := approvedBatchConfig(revision.UpSQL)
+	if err != nil {
+		return worker.Job{}, err
+	}
+	if mode == worker.Batch && !revision.Irreversible && !strings.Contains(revision.DownSQL, "$1") {
+		return worker.Job{}, fmt.Errorf("batch down_sql must consume $1 ID array")
+	}
 	job := worker.Job{ExecutionID: executionID, DatabaseID: d.DatabaseID, MigrationID: d.ID, Revision: revision.Revision, ActorID: userID,
-		Operation: worker.Apply, Mode: worker.Normal, SQL: revision.UpSQL, ReverseSQL: revision.DownSQL}
+		Operation: worker.Apply, Mode: mode, BatchTable: table, BatchSize: size, SQL: revision.UpSQL, ReverseSQL: revision.DownSQL}
 	return s.enqueueApprovedOperation(ctx, job)
 }
 
@@ -346,8 +353,15 @@ func (s *WorkflowService) submitHistoryOperation(ctx context.Context, userID, de
 	if err != nil {
 		return worker.Job{}, fmt.Errorf("create execution ID: %w", err)
 	}
+	mode, table, size, err := approvedBatchConfig(revision.UpSQL)
+	if err != nil {
+		return worker.Job{}, err
+	}
+	if mode == worker.Batch && !strings.Contains(revision.DownSQL, "$1") {
+		return worker.Job{}, fmt.Errorf("batch down_sql must consume $1 ID array")
+	}
 	job := worker.Job{ExecutionID: executionID, DatabaseID: d.DatabaseID, MigrationID: d.ID, Revision: revision.Revision, ActorID: userID,
-		Operation: operation, Mode: worker.Normal, SQL: revision.UpSQL, ReverseSQL: revision.DownSQL, SourceExecutionID: sourceExecutionID}
+		Operation: operation, Mode: mode, BatchTable: table, BatchSize: size, SQL: revision.UpSQL, ReverseSQL: revision.DownSQL, SourceExecutionID: sourceExecutionID}
 	return s.enqueueApprovedOperation(ctx, job)
 }
 

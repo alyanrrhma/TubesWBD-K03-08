@@ -275,14 +275,37 @@ func TestEndToEndAdminToViewer(t *testing.T) {
 	if _, body := s.do(v, "GET", "/dashboard", nil); !strings.Contains(body, "View &#43; Edit") {
 		t.Fatal("akses efektif harus menjadi View + Edit")
 	}
-	if r := s.post(v, db+"/migrations", url.Values{"sql": {"SELECT 1"}}); r.StatusCode != http.StatusSeeOther {
-		t.Fatalf("View + Edit harus dapat menjalankan migration, dapat %d", r.StatusCode)
+	// Milestone 2: pengguna View + Edit tetap tidak boleh menjalankan migration secara langsung melalui endpoint legacy.
+	// Eksekusi migration harus melalui revision, approval, queue, dan worker.
+	if r := s.post(v, db+"/migrations", url.Values{
+		"sql": {"SELECT 1"},
+	}); r.StatusCode != http.StatusGone {
+		t.Fatalf(
+			"View + Edit: endpoint migration langsung harus dinonaktifkan, dapat %d, ingin 410",
+			r.StatusCode,
+		)
 	}
-	if _, body := s.do(v, "GET", db+"/migrations", nil); !strings.Contains(body, "v1") {
-		t.Fatal("riwayat migration harus menampilkan versi")
+	// Halaman riwayat tetap harus bisa diakses oleh pengguna View + Edit.
+	if r, _ := s.do(v, "GET", db+"/migrations", nil); r.StatusCode != http.StatusOK {
+		t.Fatalf(
+			"View + Edit harus dapat melihat halaman riwayat migration, dapat %d",
+			r.StatusCode,
+		)
 	}
-	if r, body := s.do(v, "GET", db+"/migrations/1", nil); r.StatusCode != http.StatusOK || !strings.Contains(body, "SELECT 1") {
-		t.Fatal("detail migration harus menampilkan SQL yang dijalankan")
+	// Endpoint legacy tidak boleh mengeksekusi SQL atau menghasilkan migration history baru.
+	var migrationCount int
+	if err := s.db.QueryRowContext(
+		s.ctx,
+		`SELECT COUNT(*) FROM migration_history WHERE database_id = $1`,
+		connID,
+	).Scan(&migrationCount); err != nil {
+		t.Fatalf("gagal memeriksa migration history: %v", err)
+	}
+	if migrationCount != 0 {
+		t.Fatalf(
+			"endpoint legacy tidak boleh menghasilkan migration history, ditemukan %d",
+			migrationCount,
+		)
 	}
 
 	// --- Hapus koneksi: viewer kehilangan akses dan Registry dibersihkan.

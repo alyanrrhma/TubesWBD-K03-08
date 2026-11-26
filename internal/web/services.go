@@ -125,4 +125,5 @@ type MigrationWorkflow interface {
 	SubmitForwardJob(context.Context, int64, int64) (worker.Job, error)
 	GetGroupLeader(context.Context, int64) (migration.GroupLeader, error)
 	SetGroupLeader(context.Context, int64, int64) error
+	GetJobStatus(context.Context, int64, string) (migration.JobStatus, error)
 }

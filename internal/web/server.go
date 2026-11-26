@@ -63,6 +63,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/migrations/{definitionID}/revisions/{revision}/rejection", api(s.apiReject))
 	mux.Handle("GET /api/migrations/{definitionID}/readiness", api(s.apiReadiness))
 	mux.Handle("POST /api/migrations/{definitionID}/submit", api(s.apiSubmitJob))
+	mux.Handle("GET /api/jobs/{jobID}", api(s.apiGetJobStatus))
 	mux.Handle("POST /api/migrations/{definitionID}/rollback", api(s.apiSubmitRollbackJob))
 	mux.Handle("POST /api/migrations/{definitionID}/forward", api(s.apiSubmitForwardJob))
 	mux.Handle("GET /api/groups/{groupID}/leader", api(s.apiGetGroupLeader))
@@ -92,7 +93,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /databases/{databaseID}/migrations/explain", authed(s.migrationsExplain))
 	mux.Handle("GET /databases/{databaseID}/schema-diff", authed(s.schemaDiffPage))
 	mux.Handle("POST /databases/{databaseID}/schema-diff", authed(s.schemaDiffSubmit))
-	mux.Handle("POST /databases/{databaseID}/migrations", authed(s.migrationsExecute))
+	// Legacy M1 direct execution is disabled: all M2 execution must pass approval and queue.
+	mux.Handle("POST /databases/{databaseID}/migrations", authed(s.migrationsLegacyGone))
 
 	// Admin (hanya Platform Admin)
 	mux.Handle("GET /admin", admin(func(w http.ResponseWriter, r *http.Request) {

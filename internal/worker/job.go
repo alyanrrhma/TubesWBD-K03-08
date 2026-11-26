@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/telemetry"
 	"regexp"
 	"strings"
 	"time"
@@ -120,6 +121,9 @@ func Enqueue(ctx context.Context, db *sql.DB, j Job) (Job, error) {
 	}
 	if j.MaxAttempts == 0 {
 		j.MaxAttempts = 4
+	}
+	if j.Traceparent == "" {
+		j.Traceparent = telemetry.Traceparent(ctx)
 	}
 	_, err := db.ExecContext(ctx, `INSERT INTO migration_jobs
  (id,execution_id,database_id,migration_id,revision,actor_id,operation,mode,sql_text,reverse_sql,batch_table,batch_size,source_execution_id,traceparent,max_attempts)

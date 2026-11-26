@@ -55,14 +55,11 @@
 {{if .Result.SQL}}
 <section>
   <h2>Kandidat SQL migration</h2>
-  <p>Tinjau dan ubah SQL sebelum menjalankan. Perubahan destruktif ditandai di atas. Eksekusi tetap memakai transaksi migration biasa.</p>
-  <form method="post" action="/databases/{{.DB.ID}}/migrations" class="stack">
-    <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
-    <label>SQL yang dapat ditinjau dan diedit
-      <textarea name="sql" class="sql" rows="14" spellcheck="false" required>{{.Result.SQL}}</textarea>
-    </label>
-    <button class="btn" type="submit" data-confirm="Jalankan kandidat schema diff ini pada {{.DB.Name}}?">Jalankan migration</button>
-  </form>
+  <p>Tinjau SQL kandidat. Perubahan destruktif ditandai di atas; eksekusi harus melalui approval dan queue worker.</p>
+  <p class="muted">Salin kandidat SQL di bawah ke revision migration pada workflow M2 untuk ditinjau dan disetujui sebelum dijalankan oleh worker.</p>
+  <label>SQL kandidat (salin ke revision)
+    <textarea class="sql" rows="14" spellcheck="false" readonly>{{.Result.SQL}}</textarea>
+  </label>
 </section>
 {{end}}
 {{end}}

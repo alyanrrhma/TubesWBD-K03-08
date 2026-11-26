@@ -23,7 +23,8 @@ import (
 )
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(log)
 	if err := run(log); err != nil {
 		log.Error("aplikasi berhenti", "err", err)
 		os.Exit(1)

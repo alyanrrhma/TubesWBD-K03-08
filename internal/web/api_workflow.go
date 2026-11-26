@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/telemetry"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
@@ -332,7 +333,9 @@ func (s *Server) apiSubmitJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	job, err := s.Workflow.SubmitJob(r.Context(), currentUser(r).ID, id)
+	traceCtx, endSpan := telemetry.Start(telemetry.FromHeader(r.Context(), r.Header.Get("traceparent")), "api.migration.enqueue", map[string]any{"migration_id": id})
+	job, err := s.Workflow.SubmitJob(traceCtx, currentUser(r).ID, id)
+	endSpan(err)
 	if err != nil {
 		s.apiFail(w, r, err)
 		return
@@ -359,7 +362,9 @@ func (s *Server) apiSubmitHistoryJob(w http.ResponseWriter, r *http.Request, sub
 	if !ok {
 		return
 	}
-	job, err := submit(r.Context(), currentUser(r).ID, id)
+	traceCtx, endSpan := telemetry.Start(telemetry.FromHeader(r.Context(), r.Header.Get("traceparent")), "api.migration.enqueue_operation", map[string]any{"migration_id": id})
+	job, err := submit(traceCtx, currentUser(r).ID, id)
+	endSpan(err)
 	if err != nil {
 		s.apiFail(w, r, err)
 		return

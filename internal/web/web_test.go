@@ -2,6 +2,7 @@ package web_test
 
 import (
 	"context"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -516,12 +517,12 @@ func TestSchemaDiffGeneratesEditableCandidateAndRequiresEditAccess(t *testing.T)
 	e := newEnv(t)
 	alice := e.login("alice")
 	_, body := e.get(alice, "/databases/100/schema-diff")
-	if !strings.Contains(body, "Schema diff") || !strings.Contains(body, `name="desired_schema"`) || !strings.Contains(body, `"schema":"public"`) {
+	if !strings.Contains(body, "Schema diff") || !strings.Contains(body, `name="desired_schema"`) || !strings.Contains(html.UnescapeString(body), `"schema":"public"`) {
 		t.Fatal("schema diff page should show current schema as editable JSON")
 	}
 	desired := `{"schema":"public","tables":[]}`
 	resp, body := e.postCSRF(alice, "/databases/100/schema-diff", url.Values{"desired_schema": {desired}})
-	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Perubahan schema") || !strings.Contains(body, `name="sql"`) || !strings.Contains(body, "DROP TABLE") || !strings.Contains(body, "Perubahan destruktif") {
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Perubahan schema") || !strings.Contains(body, "Kandidat SQL migration") || !strings.Contains(body, "DROP TABLE") || !strings.Contains(body, "Perubahan destruktif") {
 		t.Fatalf("schema diff should render the change and editable SQL candidate, status %d", resp.StatusCode)
 	}
 	if len(e.migs.history) != 0 {
@@ -534,42 +535,34 @@ func TestSchemaDiffGeneratesEditableCandidateAndRequiresEditAccess(t *testing.T)
 	}
 }
 
-func TestMigrationExecuteSuccessFailureAndEmpty(t *testing.T) {
+// M2 requires all execution to go through approval and the worker. The old
+// HTML route must not execute, even for an editor or invalid SQL.
+func TestLegacyMigrationExecutionIsDisabled(t *testing.T) {
 	e := newEnv(t)
 	alice := e.login("alice")
 	path := "/databases/100/migrations"
-
-	resp, _ := e.postCSRF(alice, path, url.Values{"sql": {"ALTER TABLE orders ADD COLUMN note TEXT;"}})
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("migration sukses: status %d", resp.StatusCode)
+	for _, sql := range []string{"ALTER TABLE orders ADD COLUMN note TEXT;", "SELECT fail;", "  \n "} {
+		resp, _ := e.postCSRF(alice, path, url.Values{"sql": {sql}})
+		if resp.StatusCode != http.StatusGone {
+			t.Fatalf("legacy migration must return 410, got %d for %q", resp.StatusCode, sql)
+		}
 	}
-	_, body := e.get(alice, path)
-	if !strings.Contains(body, "Migration berhasil di-commit.") ||
-		!strings.Contains(body, `href="/databases/100/migrations/1"`) ||
-		!strings.Contains(body, `name="sql"`) {
-		t.Fatal("history harus menampilkan tautan v1, flash sukses, dan editor")
-	}
-
-	bad := "SELECT fail;"
-	resp, body = e.postCSRF(alice, path, url.Values{"sql": {bad}})
-	if resp.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(body, "di-rollback") || !strings.Contains(body, bad) {
-		t.Fatalf("migration gagal: status %d; SQL harus dipertahankan dan rollback dilaporkan", resp.StatusCode)
-	}
-	resp, body = e.postCSRF(alice, path, url.Values{"sql": {"  \n "}})
-	if resp.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(body, "tidak boleh kosong") {
-		t.Fatalf("SQL kosong: status %d", resp.StatusCode)
+	if len(e.migs.history) != 0 {
+		t.Fatal("legacy endpoint must never execute SQL")
 	}
 }
 
+// Legacy read-only history is retained; seed the fake history directly instead
+// of creating entries using the now-disabled synchronous migration endpoint.
 func TestMigrationHistoryPagination(t *testing.T) {
 	e := newEnv(t)
 	alice := e.login("alice")
 	path := "/databases/100/migrations"
-	for i := 0; i < 27; i++ {
-		resp, _ := e.postCSRF(alice, path, url.Values{"sql": {"SELECT 1"}})
-		if resp.StatusCode != http.StatusSeeOther {
-			t.Fatalf("migration %d: status %d", i+1, resp.StatusCode)
-		}
+	for i := 27; i >= 1; i-- {
+		e.migs.history = append(e.migs.history, web.MigrationRecord{
+			ID: int64(i), Version: i, SQL: "SELECT 1", Status: web.MigrationSuccess,
+			ExecutedBy: "tester", ExecutedAt: time.Now(),
+		})
 	}
 	_, body := e.get(alice, path+"?page=2")
 	if !strings.Contains(body, "Halaman 2 dari 2") ||

@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/telemetry"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -84,7 +86,7 @@ func (w *Worker) claim(ctx context.Context) (*Job, error) {
  traceparent,max_attempts,attempt,batches_done,rows_done FROM migration_jobs j
  WHERE ((j.status IN ('pending','retrying','partial','partially_reverted') AND j.available_at<=NOW())
  OR (j.status='running' AND j.heartbeat_at < NOW()-INTERVAL '5 minutes'))
- AND (j.attempt < j.max_attempts OR j.status = 'running')
+ AND (j.attempt < j.max_attempts OR j.status = 'running' OR (j.status='retrying' AND j.last_error IS NULL))
  AND NOT EXISTS(SELECT 1 FROM migration_jobs b WHERE b.database_id=j.database_id AND b.id<>j.id
  AND b.status IN ('running','partial','partially_reverted','uncertain'))
  ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED`)
@@ -124,9 +126,13 @@ func (w *Worker) claim(ctx context.Context) (*Job, error) {
 }
 func (w *Worker) process(ctx context.Context, j Job) error {
 	start := time.Now()
+	ctx, endWorker := telemetry.Start(telemetry.FromHeader(ctx, j.Traceparent), "worker.migration", map[string]any{"execution_id": j.ExecutionID, "migration_id": j.MigrationID, "attempt": j.Attempt})
+	var spanError error
+	defer func() { endWorker(spanError) }()
 	log := w.logger().With("job_id", j.ID, "execution_id", j.ExecutionID, "migration_id", j.MigrationID,
-		"revision", j.Revision, "database", j.DatabaseID, "actor", j.ActorID, "attempt", j.Attempt, "operation", j.Operation)
-	log.Info("job_started", "status", "running", "traceparent", j.Traceparent)
+		"revision", j.Revision, "database", j.DatabaseID, "actor", j.ActorID, "attempt", j.Attempt, "operation", j.Operation,
+		"trace_id", telemetry.TraceID(ctx), "span_id", telemetry.SpanID(ctx))
+	log.Info("job_started", "status", "running", "sql_text", effectiveSQL(j))
 	if err := j.Validate(); err != nil {
 		return w.finish(ctx, j, err, false)
 	}
@@ -159,6 +165,13 @@ func (w *Worker) process(ctx context.Context, j Job) error {
 		_, _ = conn.ExecContext(c, `SELECT pg_advisory_unlock($1)`, lockKey)
 	}()
 	log.Info("lock_acquired", "status", "running")
+	// A separate platform connection renews the lease during long SQL statements.
+	// Stop and join the heartbeat before returning (including on panic-free error paths).
+	runCtx, cancelJob := context.WithCancel(ctx)
+	defer cancelJob()
+	stopHeartbeat := w.startHeartbeat(runCtx, j, log, cancelJob)
+	defer stopHeartbeat()
+	ctx = runCtx
 	// No schema mutation is accepted until the target-side proof ledger exists.
 	if err = w.ensureProof(ctx, conn); err != nil {
 		return w.finish(ctx, j, err, false)
@@ -174,11 +187,21 @@ func (w *Worker) process(ctx context.Context, j Job) error {
 		err = w.batches(ctx, conn, j, log)
 	}
 	if errors.Is(err, ErrUncertain) {
+		spanError = err
 		log.Error("commit_uncertain", "status", "uncertain", "duration", time.Since(start))
 		return w.uncertain(ctx, j, err)
 	}
 	if err != nil {
+		spanError = err
+		// The target is authoritative: a platform counter might lag a committed batch.
+		if syncErr := w.syncProgress(ctx, conn, j); syncErr != nil {
+			log.Error("checkpoint_reconciliation_failed", "error", syncErr)
+			return w.uncertain(ctx, j, fmt.Errorf("cannot reconcile committed checkpoints: %w", syncErr))
+		}
 		return w.finish(ctx, j, err, isTransient(err))
+	}
+	if err = w.syncProgress(ctx, conn, j); err != nil {
+		return w.uncertain(ctx, j, fmt.Errorf("cannot reconcile successful execution: %w", err))
 	}
 	log.Info("job_succeeded", "status", "success", "duration", time.Since(start))
 	return w.succeed(ctx, j)
@@ -214,14 +237,16 @@ func (w *Worker) normal(ctx context.Context, c *sql.Conn, j Job, log *slog.Logge
 	}
 	defer tx.Rollback()
 	started := time.Now()
-	log.Info("sql_started", "query", statement, "batch", 0)
-	res, err := tx.ExecContext(ctx, statement)
+	log.Info("sql_started", "batch", 0)
+	sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.sql", map[string]any{"operation": j.Operation, "mode": j.Mode, "batch": 0})
+	res, err := tx.ExecContext(sqlCtx, statement)
+	endSQL(err)
 	if err != nil {
-		log.Error("sql_failed", "query", statement, "error", err)
+		log.Error("sql_failed", "error", err)
 		return err
 	}
 	rows, _ := res.RowsAffected()
-	log.Info("sql_finished", "query", statement, "rows", rows, "duration", time.Since(started))
+	log.Info("sql_finished", "rows", rows, "duration", time.Since(started))
 	if _, err = tx.ExecContext(ctx, `INSERT INTO __dbmp_worker_proof(execution_id,batch_no,source_execution_id) VALUES($1,0,$2)`, j.ExecutionID, nullable(j.SourceExecutionID)); err != nil {
 		return err
 	}
@@ -337,8 +362,10 @@ func (w *Worker) batches(ctx context.Context, c *sql.Conn, j Job, log *slog.Logg
 			return nil
 		}
 		started := time.Now()
-		log.Info("sql_started", "batch", next, "query", j.SQL, "parameters", map[string]any{"ids": ids})
-		res, e := tx.ExecContext(ctx, j.SQL, ids)
+		log.Info("sql_started", "batch", next, "selected_rows", len(ids))
+		sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.batch", map[string]any{"batch": next, "rows": len(ids)})
+		res, e := tx.ExecContext(sqlCtx, j.SQL, ids)
+		endSQL(e)
 		if e != nil {
 			_ = tx.Rollback()
 			log.Error("batch_failed", "batch", next, "error", e)
@@ -395,39 +422,28 @@ func selectIDs(ctx context.Context, tx *sql.Tx, table string, cursor, upper int6
 func (w *Worker) reverseBatches(ctx context.Context, c *sql.Conn, j Job, log *slog.Logger) error {
 	// Each compensation is an independent, durable transaction. Reverse order
 	// is crucial when later batches depend on earlier changed rows.
-	rows, err := c.QueryContext(ctx, `SELECT batch_no,batch_ids FROM __dbmp_worker_proof
- WHERE execution_id=$1 AND batch_no>=0 ORDER BY batch_no DESC`, j.SourceExecutionID)
-	if err != nil {
+	var upper int64
+	if err := c.QueryRowContext(ctx, `SELECT COALESCE(MAX(batch_no),-1) FROM __dbmp_worker_proof WHERE execution_id=$1 AND batch_no>=0`, j.SourceExecutionID).Scan(&upper); err != nil {
 		return err
 	}
-	type batch struct {
-		n   int64
-		ids []int64
-	}
-	var todo []batch
-	for rows.Next() {
-		var b batch
-		var raw []byte
-		if err = rows.Scan(&b.n, &raw); err != nil {
-			break
-		}
-		err = json.Unmarshal(raw, &b.ids)
-		if err != nil {
-			break
-		}
-		todo = append(todo, b)
-	}
-	if closeErr := rows.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if len(todo) == 0 {
+	if upper < 0 {
 		return errors.New("no committed source batches; refusing unsafe rollback")
 	}
-	for _, b := range todo {
-		if err = w.heartbeat(ctx, j); err != nil {
+	for n := upper; n >= 0; n-- {
+		var b struct {
+			n   int64
+			ids []int64
+		}
+		b.n = n
+		var raw []byte
+		if err := c.QueryRowContext(ctx, `SELECT batch_ids FROM __dbmp_worker_proof WHERE execution_id=$1 AND batch_no=$2`, j.SourceExecutionID, n).Scan(&raw); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(raw, &b.ids); err != nil {
+			return err
+		}
+
+		if err := w.heartbeat(ctx, j); err != nil {
 			return err
 		}
 		done, e := w.proof(ctx, c, j.ExecutionID, b.n)
@@ -441,8 +457,10 @@ func (w *Worker) reverseBatches(ctx context.Context, c *sql.Conn, j Job, log *sl
 		if e != nil {
 			return e
 		}
-		log.Info("compensation_started", "batch", b.n, "query", j.ReverseSQL, "parameters", map[string]any{"ids": b.ids})
-		res, e := tx.ExecContext(ctx, j.ReverseSQL, b.ids)
+		log.Info("compensation_started", "batch", b.n, "selected_rows", len(b.ids))
+		sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.compensate", map[string]any{"batch": b.n, "rows": len(b.ids)})
+		res, e := tx.ExecContext(sqlCtx, j.ReverseSQL, b.ids)
+		endSQL(e)
 		if e != nil {
 			_ = tx.Rollback()
 			return e
@@ -456,7 +474,7 @@ func (w *Worker) reverseBatches(ctx context.Context, c *sql.Conn, j Job, log *sl
 			_ = tx.Rollback()
 			return fmt.Errorf("compensation affected %d of %d rows", affected, len(b.ids))
 		}
-		raw, _ := json.Marshal(b.ids)
+		raw, _ = json.Marshal(b.ids)
 		_, e = tx.ExecContext(ctx, `INSERT INTO __dbmp_worker_proof(execution_id,batch_no,source_execution_id,batch_ids) VALUES($1,$2,$3,$4::jsonb)`, j.ExecutionID, b.n, j.SourceExecutionID, string(raw))
 		if e != nil {
 			_ = tx.Rollback()
@@ -469,7 +487,7 @@ func (w *Worker) reverseBatches(ctx context.Context, c *sql.Conn, j Job, log *sl
 			}
 		}
 		log.Info("compensation_committed", "batch", b.n, "rows", affected)
-		if err = w.syncProgress(ctx, c, j); err != nil {
+		if err := w.syncProgress(ctx, c, j); err != nil {
 			return err
 		}
 	}
@@ -499,12 +517,22 @@ func (w *Worker) syncProgress(ctx context.Context, c *sql.Conn, j Job) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.Platform.ExecContext(ctx, `UPDATE migration_jobs SET batches_done=$2,rows_done=$3,heartbeat_at=NOW()
+	result, err := w.Platform.ExecContext(ctx, `UPDATE migration_jobs SET batches_done=$2,rows_done=$3,heartbeat_at=NOW()
  WHERE id=$1 AND attempt=$4 AND status='running'`, j.ID, batches, rows, j.Attempt)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return errors.New("lost worker lease during progress reconciliation")
+	}
+	return nil
 }
 func (w *Worker) deferBusy(ctx context.Context, j Job) error {
-	_, err := w.Platform.ExecContext(ctx, `UPDATE migration_jobs SET status='retrying',available_at=NOW()+INTERVAL '2 seconds' WHERE id=$1 AND attempt=$2`, j.ID, j.Attempt)
+	_, err := w.Platform.ExecContext(ctx, `UPDATE migration_jobs SET status='retrying',last_error=NULL,available_at=NOW()+INTERVAL '2 seconds' WHERE id=$1 AND attempt=$2`, j.ID, j.Attempt)
 	if err != nil {
 		return err
 	}
@@ -512,6 +540,9 @@ func (w *Worker) deferBusy(ctx context.Context, j Job) error {
 	return err
 }
 func (w *Worker) uncertain(ctx context.Context, j Job, err error) error {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	ctx = cleanup
 	_, e := w.Platform.ExecContext(ctx, `UPDATE migration_jobs SET status='uncertain',last_error=$2 WHERE id=$1 AND attempt=$3`, j.ID, truncateError(err), j.Attempt)
 	if e != nil {
 		return e
@@ -520,6 +551,9 @@ func (w *Worker) uncertain(ctx context.Context, j Job, err error) error {
 	return e
 }
 func (w *Worker) finish(ctx context.Context, j Job, cause error, transient bool) error {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	ctx = cleanup
 	status := Failed
 	var committed int64
 	_ = w.Platform.QueryRowContext(ctx, `SELECT batches_done FROM migration_jobs WHERE id=$1`, j.ID).Scan(&committed)
@@ -552,6 +586,9 @@ func truncateError(e error) string {
 	return s
 }
 func (w *Worker) succeed(ctx context.Context, j Job) error {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	ctx = cleanup
 	tx, err := w.Platform.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -566,6 +603,26 @@ func (w *Worker) succeed(ctx context.Context, j Job) error {
 		effectiveSQL(j))
 	if err != nil {
 		return err
+	}
+	if j.Operation == Apply {
+		// Commit workflow metadata atomically with job history in the platform DB.
+		// The target proof ledger remains the source of truth for target-side commit.
+		result, e := tx.ExecContext(ctx, `UPDATE migration_revisions SET workflow_status='executed',
+    executed_at=NOW(),execution_id=$3 WHERE definition_id=$1 AND revision=$2
+    AND workflow_status='approved' AND executed_at IS NULL`, j.MigrationID, j.Revision, j.ExecutionID)
+		if e != nil {
+			return e
+		}
+		n, e := result.RowsAffected()
+		if e != nil {
+			return e
+		}
+		if n != 1 {
+			return fmt.Errorf("approved revision not eligible for executed state: %d", n)
+		}
+		if _, e = tx.ExecContext(ctx, `UPDATE migration_definitions SET workflow_status='executed',updated_at=NOW() WHERE id=$1`, j.MigrationID); e != nil {
+			return e
+		}
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE migration_jobs SET status='success',finished_at=NOW(),last_error=NULL WHERE id=$1 AND attempt=$2`, j.ID, j.Attempt)
 	if err != nil {
@@ -592,4 +649,32 @@ func isTransient(err error) bool {
 		return strings.HasPrefix(pg.Code, "08") || pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03" || pg.Code == "57014"
 	}
 	return false
+}
+
+// startHeartbeat keeps the queue lease alive independently from the target
+// connection (which can be occupied by a long-running SQL statement).
+func (w *Worker) startHeartbeat(ctx context.Context, j Job, log *slog.Logger, cancelExecution context.CancelFunc) func() {
+	hbCtx, cancel := context.WithCancel(ctx)
+	var done sync.WaitGroup
+	done.Add(1)
+	go func() {
+		defer done.Done()
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+				pulseCtx, stop := context.WithTimeout(hbCtx, 5*time.Second)
+				err := w.heartbeat(pulseCtx, j)
+				stop()
+				if err != nil {
+					log.Error("job_heartbeat_failed", "error", err)
+					cancelExecution()
+				}
+			}
+		}
+	}()
+	return func() { cancel(); done.Wait() }
 }

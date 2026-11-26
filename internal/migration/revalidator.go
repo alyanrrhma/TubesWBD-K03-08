@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
@@ -39,7 +40,7 @@ func (v *Revalidator) Revalidate(ctx context.Context, j worker.Job) error {
 	if v == nil || v.Platform == nil || v.Authz == nil {
 		return worker.ErrUnapproved
 	}
-	if (j.Operation != worker.Apply && j.Operation != worker.Rollback && j.Operation != worker.Forward) || j.Mode != worker.Normal || j.DatabaseID <= 0 || j.MigrationID <= 0 || j.Revision <= 0 || j.ActorID <= 0 {
+	if (j.Operation != worker.Apply && j.Operation != worker.Rollback && j.Operation != worker.Forward) || (j.Mode != worker.Normal && j.Mode != worker.Batch) || j.DatabaseID <= 0 || j.MigrationID <= 0 || j.Revision <= 0 || j.ActorID <= 0 {
 		return worker.ErrUnapproved
 	}
 
@@ -70,7 +71,13 @@ func (v *Revalidator) Revalidate(ctx context.Context, j worker.Job) error {
 	if err != nil {
 		return fmt.Errorf("load approved migration snapshot: %w", err)
 	}
+	mode, table, size, configErr := approvedBatchConfig(upSQL)
+	if configErr != nil {
+		return ErrJobSnapshotMismatch
+	}
 	if databaseID != j.DatabaseID || definitionID != j.MigrationID || revisionNumber != j.Revision ||
+		j.Mode != mode || j.BatchTable != table || j.BatchSize != size ||
+		(mode == worker.Batch && !irreversible && !strings.Contains(downSQL, "$1")) ||
 		j.SQL != upSQL || j.ReverseSQL != downSQL || (irreversible && j.ReverseSQL != "") {
 		return ErrJobSnapshotMismatch
 	}

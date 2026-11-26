@@ -113,6 +113,26 @@ func (s *Server) migrationsExplain(w http.ResponseWriter, r *http.Request) {
 	s.renderMigrationsMode(w, r, id, http.StatusOK, sql, "", plan, analyze)
 }
 
+// migrationsLegacyGone denies the old synchronous endpoint without executing SQL.
+// Authorize before reporting the deprecation so clients without edit permission
+// cannot distinguish a valid target from an unauthorized one.
+func (s *Server) migrationsLegacyGone(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.pathID(w, r, "databaseID")
+	if !ok {
+		return
+	}
+	db, err := s.Viewer.Database(r.Context(), currentUser(r).ID, id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if db.Level < access.ViewEdit {
+		s.fail(w, r, access.ErrForbidden)
+		return
+	}
+	http.Error(w, "Direct SQL migration disabled. Use /api/databases/{databaseID}/migrations and the approval workflow.", http.StatusGone)
+}
+
 func (s *Server) migrationsExecute(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.pathID(w, r, "databaseID")
 	if !ok {

@@ -24,7 +24,7 @@
       <div class="actions">
         <button class="btn btn-secondary" type="submit" name="mode" value="explain" formaction="/databases/{{.DB.ID}}/migrations/explain">Analisis execution plan</button>
         <button class="btn btn-secondary" type="submit" name="mode" value="analyze" formaction="/databases/{{.DB.ID}}/migrations/explain" data-confirm="EXPLAIN ANALYZE benar-benar menjalankan statement. Perubahan transaksional akan di-rollback, tetapi sequence atau efek eksternal mungkin tetap terjadi. Lanjutkan hanya untuk query yang aman.">Jalankan EXPLAIN ANALYZE</button>
-        <button class="btn" type="submit" data-confirm="Jalankan migration ini pada {{.DB.Name}}?">Jalankan migration</button>
+        <p class="muted">Untuk mengeksekusi migration, buat revision melalui workflow API, lalu ajukan review, approval, dan enqueue worker. Eksekusi langsung di halaman ini dinonaktifkan.</p>
       </div>
     </form>
     {{if .Plan}}

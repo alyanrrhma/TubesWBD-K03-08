@@ -353,6 +353,11 @@ func TestRollbackAndForwardJobsUseApprovedImmutableSnapshot(t *testing.T) {
 	}
 
 	recordWorkerHistory(t, f, d, revision, worker.Rollback, "rollback-done", "apply-original")
+	// Simulate completion of the queued rollback job.
+	_, err = f.db.Exec(`UPDATE migration_jobs SET status = 'success', finished_at = NOW() WHERE id = $1`, rollback.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	forward, err := f.svc.SubmitForwardJob(context.Background(), f.user1, d.ID)
 	if err != nil {
 		t.Fatal(err)
