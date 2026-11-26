@@ -55,7 +55,11 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 		defer func() {
 			if v := recover(); v != nil {
 				s.Logger.Error("panic", "value", v, "path", r.URL.Path)
-				http.Error(w, "Terjadi kesalahan pada server.", http.StatusInternalServerError)
+				if strings.HasPrefix(r.URL.Path, "/api/") {
+					writeAPIError(w, http.StatusInternalServerError, "server_error", "Permintaan tidak dapat diproses.")
+				} else {
+					http.Error(w, "Terjadi kesalahan pada server.", http.StatusInternalServerError)
+				}
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -146,7 +150,7 @@ func (s *Server) ensureCSRF(w http.ResponseWriter, r *http.Request, sess auth.Se
 		return v
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		return "" 
+		return ""
 	}
 	tok, err := s.Sessions.IssueCSRF(r.Context(), sess)
 	if err != nil {
@@ -177,7 +181,7 @@ func (s *Server) requireAdmin(next http.Handler) http.Handler {
 	})
 }
 
-const maxFormBytes = 1 << 20 
+const maxFormBytes = 1 << 20
 
 // csrfProtect memeriksa Origin dan token CSRF pada semua method yang mengubah
 // state. Token dari form field csrf_token atau header X-CSRF-Token, dicocokkan

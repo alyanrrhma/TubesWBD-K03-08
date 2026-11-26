@@ -54,6 +54,7 @@ type env struct {
 	access         fakeAccess
 	viewer         *fakeViewer
 	migs           *recordingMigrations
+	workflow       *fakeWorkflow
 	clock          *clock
 	mgr            *auth.Manager
 	admin          *fakeAdmin
@@ -103,13 +104,14 @@ func newEnv(t *testing.T) *env {
 		},
 	}
 	e.migs = &recordingMigrations{access: e.access}
+	e.workflow = &fakeWorkflow{}
 	adminSvc := &fakeAdmin{users: users, connections: []admin.Connection{{ID: 1, Name: "Target", Host: "localhost", Port: 5433, Database: "dbmp_target", Username: "dbmp", SSLMode: "disable", Complete: true}}}
 	e.admin = adminSvc
 
 	srv, err := web.New(web.Deps{
 		Config: cfg, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Sessions: mgr, Users: users, Admin: adminSvc,
-		Viewer: e.viewer, Migrations: e.migs,
+		Viewer: e.viewer, Migrations: e.migs, Workflow: e.workflow,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -13,6 +13,7 @@ import (
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/database"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/web"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 // Fake sederhana agar test handler tidak membutuhkan PostgreSQL. Alur dengan database nyata ada di tests/integration.
@@ -207,6 +208,87 @@ func (v *fakeViewer) TableData(ctx context.Context, u, d int64, schema, table st
 type recordingMigrations struct {
 	access  fakeAccess
 	history []web.MigrationRecord
+}
+
+type fakeWorkflow struct {
+	web.MigrationWorkflow
+	createErr        error
+	created          migration.RevisionInput
+	getRevision      migration.MigrationRevision
+	submitErr        error
+	review           migration.ReviewStatus
+	approval         migration.Approval
+	approvalComplete bool
+	approvalErr      error
+	approved         migration.MigrationRevision
+	approvedErr      error
+	rejectErr        error
+	job              worker.Job
+	submitJobErr     error
+}
+
+func (f *fakeWorkflow) CreateMigration(_ context.Context, userID, databaseID int64, in migration.RevisionInput) (migration.MigrationDefinition, migration.MigrationRevision, error) {
+	f.created = in
+	if f.createErr != nil {
+		return migration.MigrationDefinition{}, migration.MigrationRevision{}, f.createErr
+	}
+	if userID <= 0 || databaseID <= 0 || strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.UpSQL) == "" || (!in.Irreversible && strings.TrimSpace(in.DownSQL) == "") {
+		return migration.MigrationDefinition{}, migration.MigrationRevision{}, migration.ErrInvalidRevision
+	}
+	return migration.MigrationDefinition{ID: 7, DatabaseID: databaseID, Name: in.Name, WorkflowStatus: migration.WorkflowDraft, Revision: 1}, migration.MigrationRevision{ID: 9, DefinitionID: 7, Revision: 1, UpSQL: in.UpSQL, DownSQL: in.DownSQL, WorkflowStatus: migration.WorkflowDraft}, nil
+}
+
+func (f *fakeWorkflow) GetRevision(_ context.Context, _ int64, definitionID, revision int64) (migration.MigrationRevision, error) {
+	v := f.getRevision
+	if v.ID == 0 {
+		v = migration.MigrationRevision{ID: 9, DefinitionID: definitionID, Revision: revision, WorkflowStatus: migration.WorkflowInReview}
+	}
+	return v, nil
+}
+func (f *fakeWorkflow) SubmitReview(_ context.Context, _ int64, definitionID int64) (migration.MigrationRevision, error) {
+	if f.submitErr != nil {
+		return migration.MigrationRevision{}, f.submitErr
+	}
+	return migration.MigrationRevision{ID: 9, DefinitionID: definitionID, Revision: 1, WorkflowStatus: migration.WorkflowInReview}, nil
+}
+func (f *fakeWorkflow) ReviewStatus(context.Context, int64, int64) (migration.ReviewStatus, error) {
+	if f.review.Status == "" {
+		return migration.ReviewStatus{DefinitionID: 7, RevisionID: 9, Revision: 1, Status: migration.WorkflowInReview, RequiredApprovals: 2, CompletedApprovals: 1}, nil
+	}
+	return f.review, nil
+}
+func (f *fakeWorkflow) Approve(context.Context, int64, int64, int64) (migration.Approval, bool, error) {
+	return f.approval, f.approvalComplete, f.approvalErr
+}
+func (f *fakeWorkflow) ApproveForDefinition(ctx context.Context, userID, definitionID, revision, groupID int64) (migration.Approval, bool, error) {
+	return f.Approve(ctx, userID, revision, groupID)
+}
+func (f *fakeWorkflow) RejectForDefinition(context.Context, int64, int64, int64, int64) (migration.Approval, error) {
+	return migration.Approval{Decision: "rejected"}, f.rejectErr
+}
+func (f *fakeWorkflow) ApprovedRevision(context.Context, int64) (migration.MigrationRevision, error) {
+	if f.approvedErr != nil {
+		return migration.MigrationRevision{}, f.approvedErr
+	}
+	if f.approved.ID == 0 {
+		return migration.MigrationRevision{ID: 9, DefinitionID: 7, Revision: 1, WorkflowStatus: migration.WorkflowApproved}, nil
+	}
+	return f.approved, nil
+}
+func (f *fakeWorkflow) SubmitJob(context.Context, int64, int64) (worker.Job, error) {
+	if f.submitJobErr != nil {
+		return worker.Job{}, f.submitJobErr
+	}
+	if f.job.ID == "" {
+		f.job = worker.Job{ID: "job-123", ExecutionID: "exec-456", Status: worker.Pending}
+	}
+	return f.job, nil
+}
+func (f *fakeWorkflow) SubmitRollbackJob(ctx context.Context, userID, definitionID int64) (worker.Job, error) {
+	return f.SubmitJob(ctx, userID, definitionID)
+}
+func (f *fakeWorkflow) SubmitForwardJob(ctx context.Context, userID, definitionID int64) (worker.Job, error) {
+	return f.SubmitJob(ctx, userID, definitionID)
 }
 
 func (m *recordingMigrations) History(ctx context.Context, u, d int64, page, pageSize int) ([]web.MigrationRecord, int, error) {
