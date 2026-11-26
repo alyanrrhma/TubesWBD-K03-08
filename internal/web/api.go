@@ -395,6 +395,9 @@ func (s *Server) apiAdminGroups(w http.ResponseWriter, r *http.Request) {
 			s.apiServiceError(w, err)
 			return
 		}
+		if items == nil {
+			items = []admin.Group{}
+		}
 		apiJSON(w, 200, items)
 	case http.MethodPost:
 		var in struct {
@@ -536,6 +539,9 @@ func (s *Server) apiAdminConnections(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.apiServiceError(w, err)
 			return
+		}
+		if items == nil {
+			items = []admin.Connection{}
 		}
 		apiJSON(w, 200, items)
 	case http.MethodPost:

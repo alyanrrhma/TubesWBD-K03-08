@@ -16,21 +16,35 @@ function match(path) {
   return null;
 }
 export function startRouter(root, shell) {
-  async function render() {
+  function focusRouteTarget(target) {
+    if (!target) return;
+    if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+    target.focus();
+  }
+  async function render(shouldFocus = false) {
     const path = location.pathname;
     const found = match(path);
     if (!found) {
       root.innerHTML = shell(null, "Halaman tidak ditemukan", `<header class="pagehead"><h1>Halaman tidak ditemukan</h1></header><p>Rute <code>${escapeHTML(path)}</code> tidak tersedia.</p>`);
-      return;
+    } else {
+      try {
+        await found.render(root, found.params);
+      } catch (error) {
+        root.innerHTML = shell(null, "Terjadi kesalahan", `<header class="pagehead"><h1>Terjadi kesalahan</h1></header><div class="flash flash-error" role="alert">${escapeHTML(error.message)}</div><button class="btn" data-back>Kembali</button>`);
+      }
     }
-    try {
-      await found.render(root, found.params);
-      if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
-    } catch (error) {
-      root.innerHTML = shell(null, "Terjadi kesalahan", `<header class="pagehead"><h1>Terjadi kesalahan</h1></header><div class="flash flash-error" role="alert">${escapeHTML(error.message)}</div><button class="btn" data-back>Kembali</button>`);
+    const hashTarget = location.hash
+      ? document.getElementById(decodeURIComponent(location.hash.slice(1)))
+      : null;
+    const target = hashTarget || (shouldFocus
+      ? root.querySelector("main h1") || root.querySelector("main")
+      : null);
+    if (target) {
+      focusRouteTarget(target);
+      if (hashTarget) target.scrollIntoView();
     }
   }
-  window.addEventListener("popstate", render);
+  window.addEventListener("popstate", () => render(true));
   root.addEventListener("click", (event) => {
     const link = event.target.closest("a[data-link]");
     if (link && link.origin === location.origin) { event.preventDefault(); navigate(link.pathname + link.search + link.hash); }

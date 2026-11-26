@@ -166,6 +166,7 @@ input,select,textarea { width:100%; min-width:0; padding:.65rem .7rem; border:1p
  .topbar nav a { white-space:nowrap; }
  .userbox { margin-left:auto; }
  .page { padding:1rem 1rem 3rem; }
+ .page section[id] { scroll-margin-top:10rem; }
  .pagehead h1 { font-size:1.55rem; }
  .table-wrap table { min-width:560px; }
 }

@@ -382,6 +382,20 @@ func TestAdminAPIRestrictsAdminResources(t *testing.T) {
 	}
 }
 
+func TestEmptyAdminCollectionsAreJSONArrays(t *testing.T) {
+	e := newEnv(t)
+	e.admin.groups = nil
+	e.admin.connections = nil
+	c := e.login("admin")
+
+	for _, path := range []string{"/api/admin/groups", "/api/admin/connections"} {
+		resp, body := e.get(c, path)
+		if resp.StatusCode != http.StatusOK || strings.TrimSpace(body) != "[]" {
+			t.Fatalf("empty collection %s must return [], status=%d body=%s", path, resp.StatusCode, body)
+		}
+	}
+}
+
 func TestAdminAPICreatesUsersAndProtectsCurrentAccount(t *testing.T) {
 	e := newEnv(t)
 	c := e.login("admin")
