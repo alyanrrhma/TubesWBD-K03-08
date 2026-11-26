@@ -102,3 +102,23 @@ type Migrations interface {
 	CurrentSchema(ctx context.Context, userID, databaseID int64, schema string) (string, error)
 	Execute(ctx context.Context, userID, databaseID int64, sql string) (*MigrationRecord, error)
 }
+
+// MigrationWorkflow is separate from Migrations to keep the M1 interface and
+// its existing test doubles unchanged.
+type MigrationWorkflow interface {
+	CreateMigration(context.Context, int64, int64, migration.RevisionInput) (migration.MigrationDefinition, migration.MigrationRevision, error)
+	ListMigrations(context.Context, int64, int64) ([]migration.MigrationDefinition, error)
+	GetMigration(context.Context, int64, int64) (migration.MigrationDefinition, error)
+	UpdateMigration(context.Context, int64, int64, migration.RevisionInput) (migration.MigrationRevision, error)
+	ListRevisions(context.Context, int64, int64) ([]migration.MigrationRevision, error)
+	GetRevision(context.Context, int64, int64, int64) (migration.MigrationRevision, error)
+	SubmitReview(context.Context, int64, int64) (migration.MigrationRevision, error)
+	ReviewStatus(context.Context, int64, int64) (migration.ReviewStatus, error)
+	ListApprovals(context.Context, int64, int64, int64) ([]migration.Approval, error)
+	Approve(context.Context, int64, int64, int64) (migration.Approval, bool, error)
+	ApproveForDefinition(context.Context, int64, int64, int64, int64) (migration.Approval, bool, error)
+	RejectForDefinition(context.Context, int64, int64, int64, int64) (migration.Approval, error)
+	ApprovedRevision(context.Context, int64) (migration.MigrationRevision, error)
+	GetGroupLeader(context.Context, int64) (migration.GroupLeader, error)
+	SetGroupLeader(context.Context, int64, int64) error
+}

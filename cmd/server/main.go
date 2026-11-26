@@ -86,6 +86,7 @@ func run(log *slog.Logger) error {
 	}
 
 	migrations := migration.NewService(platformDB, targets, migration.AccessAuthorizer{Access: accessService})
+	workflow := migration.NewWorkflowService(platformDB, migration.AccessAuthorizer{Access: accessService})
 	server, err := web.New(web.Deps{
 		Config:     cfg,
 		Logger:     log,
@@ -94,6 +95,7 @@ func run(log *slog.Logger) error {
 		Admin:      adminService,
 		Viewer:     web.DatabaseViewer{Access: accessService, Conns: adminService, Registry: targets},
 		Migrations: web.MigrationAdapter{Service: migrations},
+		Workflow:   workflow,
 		Health:     platformDB.PingContext,
 	})
 	if err != nil {

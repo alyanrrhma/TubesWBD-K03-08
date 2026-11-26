@@ -19,6 +19,7 @@ type Deps struct {
 	Admin      AdminService
 	Viewer     Viewer
 	Migrations Migrations
+	Workflow   MigrationWorkflow
 	Health     func(context.Context) error // boleh nil
 }
 
@@ -45,6 +46,27 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /login", s.loginForm)
 	mux.HandleFunc("POST /login", s.loginSubmit)
+
+	api := func(h http.HandlerFunc) http.Handler { return s.requireAPIAuth(s.csrfProtectAPI(h)) }
+	apiAdmin := func(h http.HandlerFunc) http.Handler { return s.requireAPIAuth(s.requireAPIAdmin(s.csrfProtectAPI(h))) }
+	mux.Handle("GET /api/csrf", api(s.apiCSRF))
+	mux.Handle("POST /api/databases/{databaseID}/migrations", api(s.apiCreateMigration))
+	mux.Handle("GET /api/databases/{databaseID}/migrations", api(s.apiListMigrations))
+	mux.Handle("GET /api/migrations/{definitionID}", api(s.apiGetMigration))
+	mux.Handle("PUT /api/migrations/{definitionID}", api(s.apiUpdateMigration))
+	mux.Handle("GET /api/migrations/{definitionID}/revisions", api(s.apiListRevisions))
+	mux.Handle("GET /api/migrations/{definitionID}/revisions/{revision}", api(s.apiGetRevision))
+	mux.Handle("POST /api/migrations/{definitionID}/submit-review", api(s.apiSubmitReview))
+	mux.Handle("GET /api/migrations/{definitionID}/review", api(s.apiReviewStatus))
+	mux.Handle("GET /api/migrations/{definitionID}/revisions/{revision}/approvals", api(s.apiListApprovals))
+	mux.Handle("POST /api/migrations/{definitionID}/revisions/{revision}/approvals", api(s.apiApprove))
+	mux.Handle("POST /api/migrations/{definitionID}/revisions/{revision}/rejection", api(s.apiReject))
+	mux.Handle("GET /api/migrations/{definitionID}/readiness", api(s.apiReadiness))
+	mux.Handle("GET /api/groups/{groupID}/leader", api(s.apiGetGroupLeader))
+	mux.Handle("PUT /api/admin/groups/{groupID}/leader", apiAdmin(s.apiSetGroupLeader))
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		writeAPIError(w, http.StatusNotFound, "not_found", "Endpoint API tidak ditemukan.")
+	})
 
 	// Terlindungi: wajib session; method non-GET wajib Origin sesuai + token CSRF
 	authed := func(h http.HandlerFunc) http.Handler { return s.requireAuth(s.csrfProtect(h)) }
