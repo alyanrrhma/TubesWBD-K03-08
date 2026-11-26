@@ -62,6 +62,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/migrations/{definitionID}/revisions/{revision}/approvals", api(s.apiApprove))
 	mux.Handle("POST /api/migrations/{definitionID}/revisions/{revision}/rejection", api(s.apiReject))
 	mux.Handle("GET /api/migrations/{definitionID}/readiness", api(s.apiReadiness))
+	mux.Handle("POST /api/migrations/{definitionID}/submit", api(s.apiSubmitJob))
+	mux.Handle("POST /api/migrations/{definitionID}/rollback", api(s.apiSubmitRollbackJob))
+	mux.Handle("POST /api/migrations/{definitionID}/forward", api(s.apiSubmitForwardJob))
 	mux.Handle("GET /api/groups/{groupID}/leader", api(s.apiGetGroupLeader))
 	mux.Handle("PUT /api/admin/groups/{groupID}/leader", apiAdmin(s.apiSetGroupLeader))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {

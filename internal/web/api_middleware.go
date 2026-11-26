@@ -11,6 +11,7 @@ import (
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/admin"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/auth"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 type apiError struct {
@@ -153,6 +154,24 @@ func (s *Server) apiFail(w http.ResponseWriter, r *http.Request, err error) {
 		writeAPIError(w, 409, "workflow_conflict", "Operasi tidak sesuai status workflow saat ini.")
 	case errors.Is(err, migration.ErrApprovalIncomplete), errors.Is(err, migration.ErrGroupLeaderMissing), errors.Is(err, migration.ErrNoApprovalGroups):
 		writeAPIError(w, 409, "approval_incomplete", "Persyaratan review belum terpenuhi.")
+	case errors.Is(err, worker.ErrUnapproved):
+		writeAPIError(w, 409, "approval_incomplete", "Revision belum disetujui atau snapshot tidak valid.")
+	case errors.Is(err, migration.ErrMigrationAlreadyExecuted):
+		writeAPIError(w, 409, "already_executed", "Migration sudah pernah dieksekusi.")
+	case errors.Is(err, migration.ErrMigrationOrderInvalid):
+		writeAPIError(w, 409, "migration_order_invalid", "Migration belum berada pada urutan eksekusi yang valid.")
+	case errors.Is(err, migration.ErrRollbackUnavailable):
+		writeAPIError(w, 409, "rollback_unavailable", "Migration bukan migration aktif terakhir.")
+	case errors.Is(err, migration.ErrForwardUnavailable):
+		writeAPIError(w, 409, "forward_unavailable", "Migration tidak memiliki rollback sukses yang dapat di-forward.")
+	case errors.Is(err, migration.ErrIrreversibleRollback):
+		writeAPIError(w, 409, "irreversible_migration", "Migration irreversible tidak dapat di-rollback.")
+	case errors.Is(err, migration.ErrDatabaseExecutionBlocked):
+		writeAPIError(w, 409, "database_execution_blocked", "Database sedang diblokir oleh execution lain.")
+	case errors.Is(err, migration.ErrExecutionAlreadyQueued):
+		writeAPIError(w, 409, "execution_already_queued", "Migration ini sudah memiliki job aktif atau sukses.")
+	case errors.Is(err, migration.ErrJobSnapshotMismatch):
+		writeAPIError(w, 409, "revision_snapshot_mismatch", "Job tidak sesuai snapshot revision yang disetujui.")
 	case errors.Is(err, migration.ErrNotGroupLeader):
 		writeAPIError(w, 403, "not_group_leader", "Hanya leader group terkait yang dapat menyetujui revision.")
 	case errors.Is(err, migration.ErrApprovalDuplicate):

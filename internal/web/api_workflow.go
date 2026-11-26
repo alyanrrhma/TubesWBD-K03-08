@@ -1,10 +1,12 @@
 package web
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 type migrationRequest struct {
@@ -321,6 +323,50 @@ func (s *Server) apiReadiness(w http.ResponseWriter, r *http.Request) {
 	state.Status = migration.WorkflowStatus(apiWorkflowStatus(state.Status))
 	writeAPI(w, 200, map[string]any{"ready": ready, "workflow": state, "revision": v})
 }
+
+func (s *Server) apiSubmitJob(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	id, ok := apiID(w, r, "definitionID")
+	if !ok {
+		return
+	}
+	job, err := s.Workflow.SubmitJob(r.Context(), currentUser(r).ID, id)
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusAccepted, map[string]string{"job_id": job.ID, "execution_id": job.ExecutionID, "status": string(job.Status)})
+}
+
+func (s *Server) apiSubmitRollbackJob(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	s.apiSubmitHistoryJob(w, r, s.Workflow.SubmitRollbackJob)
+}
+
+func (s *Server) apiSubmitForwardJob(w http.ResponseWriter, r *http.Request) {
+	if !requireWorkflow(s, w) {
+		return
+	}
+	s.apiSubmitHistoryJob(w, r, s.Workflow.SubmitForwardJob)
+}
+
+func (s *Server) apiSubmitHistoryJob(w http.ResponseWriter, r *http.Request, submit func(context.Context, int64, int64) (worker.Job, error)) {
+	id, ok := apiID(w, r, "definitionID")
+	if !ok {
+		return
+	}
+	job, err := submit(r.Context(), currentUser(r).ID, id)
+	if err != nil {
+		s.apiFail(w, r, err)
+		return
+	}
+	writeAPI(w, http.StatusAccepted, map[string]string{"job_id": job.ID, "execution_id": job.ExecutionID, "status": string(job.Status)})
+}
+
 func (s *Server) apiGetGroupLeader(w http.ResponseWriter, r *http.Request) {
 	if !requireWorkflow(s, w) {
 		return

@@ -134,3 +134,47 @@ func TestAPIWorkflowRejectRecordsDecision(t *testing.T) {
 		t.Fatalf("rejection status=%d body=%s", resp.StatusCode, body)
 	}
 }
+
+func TestAPIWorkflowSubmitJobReturnsIdentifiersWithoutWaiting(t *testing.T) {
+	e := newEnv(t)
+	c := e.login("alice")
+	csrf := apiCSRF(t, e, c)
+	resp, body := apiRequest(t, e, c, http.MethodPost, "/api/migrations/7/submit", `{}`, csrf)
+	if resp.StatusCode != http.StatusAccepted || !strings.Contains(body, `"job_id":"job-123"`) || !strings.Contains(body, `"execution_id":"exec-456"`) || !strings.Contains(body, `"status":"pending"`) {
+		t.Fatalf("submit status=%d body=%s", resp.StatusCode, body)
+	}
+	e.workflow.submitJobErr = migration.ErrDatabaseExecutionBlocked
+	resp, body = apiRequest(t, e, c, http.MethodPost, "/api/migrations/7/submit", `{}`, csrf)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(body, `"code":"database_execution_blocked"`) {
+		t.Fatalf("enqueue error status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestAPIWorkflowSubmitJobReturnsImmediatelyWithIDs(t *testing.T) {
+	e := newEnv(t)
+	c := e.login("alice")
+	csrf := apiCSRF(t, e, c)
+	resp, body := apiRequest(t, e, c, http.MethodPost, "/api/migrations/7/submit", `{}`, csrf)
+	if resp.StatusCode != http.StatusAccepted || !strings.Contains(body, `"job_id":"job-123"`) || !strings.Contains(body, `"execution_id":"exec-456"`) || !strings.Contains(body, `"status":"pending"`) {
+		t.Fatalf("submit status=%d body=%s", resp.StatusCode, body)
+	}
+	e.workflow.submitJobErr = migration.ErrExecutionAlreadyQueued
+	resp, body = apiRequest(t, e, c, http.MethodPost, "/api/migrations/7/submit", `{}`, csrf)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(body, `"code":"execution_already_queued"`) {
+		t.Fatalf("enqueue failure status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestAPIWorkflowRollbackAndForwardReturnQueuedIdentifiers(t *testing.T) {
+	for _, route := range []string{"rollback", "forward"} {
+		t.Run(route, func(t *testing.T) {
+			e := newEnv(t)
+			c := e.login("alice")
+			csrf := apiCSRF(t, e, c)
+			resp, body := apiRequest(t, e, c, http.MethodPost, "/api/migrations/7/"+route, `{}`, csrf)
+			if resp.StatusCode != http.StatusAccepted || !strings.Contains(body, `"job_id":"job-123"`) || !strings.Contains(body, `"execution_id":"exec-456"`) {
+				t.Fatalf("%s status=%d body=%s", route, resp.StatusCode, body)
+			}
+		})
+	}
+}

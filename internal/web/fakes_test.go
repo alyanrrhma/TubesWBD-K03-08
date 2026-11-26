@@ -13,6 +13,7 @@ import (
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/database"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/web"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 // Fake sederhana agar test handler tidak membutuhkan PostgreSQL. Alur dengan database nyata ada di tests/integration.
@@ -222,6 +223,8 @@ type fakeWorkflow struct {
 	approved         migration.MigrationRevision
 	approvedErr      error
 	rejectErr        error
+	job              worker.Job
+	submitJobErr     error
 }
 
 func (f *fakeWorkflow) CreateMigration(_ context.Context, userID, databaseID int64, in migration.RevisionInput) (migration.MigrationDefinition, migration.MigrationRevision, error) {
@@ -271,6 +274,21 @@ func (f *fakeWorkflow) ApprovedRevision(context.Context, int64) (migration.Migra
 		return migration.MigrationRevision{ID: 9, DefinitionID: 7, Revision: 1, WorkflowStatus: migration.WorkflowApproved}, nil
 	}
 	return f.approved, nil
+}
+func (f *fakeWorkflow) SubmitJob(context.Context, int64, int64) (worker.Job, error) {
+	if f.submitJobErr != nil {
+		return worker.Job{}, f.submitJobErr
+	}
+	if f.job.ID == "" {
+		f.job = worker.Job{ID: "job-123", ExecutionID: "exec-456", Status: worker.Pending}
+	}
+	return f.job, nil
+}
+func (f *fakeWorkflow) SubmitRollbackJob(ctx context.Context, userID, definitionID int64) (worker.Job, error) {
+	return f.SubmitJob(ctx, userID, definitionID)
+}
+func (f *fakeWorkflow) SubmitForwardJob(ctx context.Context, userID, definitionID int64) (worker.Job, error) {
+	return f.SubmitJob(ctx, userID, definitionID)
 }
 
 func (m *recordingMigrations) History(ctx context.Context, u, d int64, page, pageSize int) ([]web.MigrationRecord, int, error) {

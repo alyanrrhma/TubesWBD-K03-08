@@ -8,6 +8,7 @@ import (
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/admin"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/database"
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/migration"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
 // AdminService dipenuhi *admin.Service. Interface ada agar handler dapat diuji tanpa database
@@ -119,6 +120,9 @@ type MigrationWorkflow interface {
 	ApproveForDefinition(context.Context, int64, int64, int64, int64) (migration.Approval, bool, error)
 	RejectForDefinition(context.Context, int64, int64, int64, int64) (migration.Approval, error)
 	ApprovedRevision(context.Context, int64) (migration.MigrationRevision, error)
+	SubmitJob(context.Context, int64, int64) (worker.Job, error)
+	SubmitRollbackJob(context.Context, int64, int64) (worker.Job, error)
+	SubmitForwardJob(context.Context, int64, int64) (worker.Job, error)
 	GetGroupLeader(context.Context, int64) (migration.GroupLeader, error)
 	SetGroupLeader(context.Context, int64, int64) error
 }
