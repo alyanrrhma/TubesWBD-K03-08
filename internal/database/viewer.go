@@ -5,14 +5,17 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/jackc/pgx/v5/pgconn"
 	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/telemetry"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type queryAuditKey struct{}
+type queryAuditSpanKey struct{}
 type queryAuditContext struct{ actorID, databaseID int64 }
 
 // WithQueryAuditContext associates a read-only target query with the HTTP
@@ -21,17 +24,23 @@ func WithQueryAuditContext(ctx context.Context, actorID, databaseID int64) conte
 	return context.WithValue(ctx, queryAuditKey{}, queryAuditContext{actorID: actorID, databaseID: databaseID})
 }
 
-func startAuditQuery(ctx context.Context, query string, parameters []any) time.Time {
+func startAuditQuery(ctx context.Context, query string, parameters []any) (context.Context, time.Time) {
 	meta, _ := ctx.Value(queryAuditKey{}).(queryAuditContext)
+	queryCtx, endSpan := telemetry.Start(ctx, "db.viewer.query", map[string]any{"database_id": meta.databaseID, "query": strings.TrimSpace(query)})
+	queryCtx = context.WithValue(queryCtx, queryAuditSpanKey{}, endSpan)
 	started := time.Now()
-	slog.Default().Info("sql_query_started", "event", "database.sql.read", "actor_id", meta.actorID, "database_id", meta.databaseID, "query", strings.TrimSpace(query), "parameters", parameters)
-	return started
+	slog.Default().Info("sql_query_started", "event", "database.sql.read", "actor_id", meta.actorID, "database_id", meta.databaseID, "trace_id", telemetry.TraceID(queryCtx), "span_id", telemetry.SpanID(queryCtx), "query", strings.TrimSpace(query), "parameters", parameters)
+	return queryCtx, started
 }
 
 func auditQuery(ctx context.Context, query string, parameters []any, started time.Time, rowCount int, err error) {
 	meta, _ := ctx.Value(queryAuditKey{}).(queryAuditContext)
+	endSpan, _ := ctx.Value(queryAuditSpanKey{}).(func(error))
 	attrs := []any{"event", "database.sql.read", "actor_id", meta.actorID, "database_id", meta.databaseID,
-		"query", strings.TrimSpace(query), "parameters", parameters, "duration_ms", time.Since(started).Milliseconds(), "row_count", rowCount}
+		"trace_id", telemetry.TraceID(ctx), "span_id", telemetry.SpanID(ctx), "query", strings.TrimSpace(query), "parameters", parameters, "duration_ms", time.Since(started).Milliseconds(), "row_count", rowCount}
+	if endSpan != nil {
+		endSpan(err)
+	}
 	if err != nil {
 		attrs = append(attrs, "status", "error", "error", err.Error())
 		var pgErr *pgconn.PgError
@@ -133,15 +142,15 @@ func ListTables(ctx context.Context, db *sql.DB, schema string) (tables []Table,
 		  AND table_type = 'BASE TABLE'
 		ORDER BY table_name
 	`
-	started := startAuditQuery(ctx, query, []any{schema})
+	queryCtx, started := startAuditQuery(ctx, query, []any{schema})
 	rows, err := db.QueryContext(ctx, query, schema)
 	if err != nil {
 		retErr = wrapQueryError("list tables", err)
-		auditQuery(ctx, query, []any{schema}, started, 0, retErr)
+		auditQuery(queryCtx, query, []any{schema}, started, 0, retErr)
 		return nil, retErr
 	}
 	defer rows.Close()
-	defer func() { auditQuery(ctx, query, []any{schema}, started, len(tables), retErr) }()
+	defer func() { auditQuery(queryCtx, query, []any{schema}, started, len(tables), retErr) }()
 
 	tables = make([]Table, 0)
 
@@ -183,15 +192,15 @@ func ListColumns(ctx context.Context, db *sql.DB, schema string, table string) (
 		  AND table_name = $2
 		ORDER BY ordinal_position
 	`
-	started := startAuditQuery(ctx, query, []any{schema, table})
+	queryCtx, started := startAuditQuery(ctx, query, []any{schema, table})
 	rows, err := db.QueryContext(ctx, query, schema, table)
 	if err != nil {
 		retErr = wrapQueryError("list columns", err)
-		auditQuery(ctx, query, []any{schema, table}, started, 0, retErr)
+		auditQuery(queryCtx, query, []any{schema, table}, started, 0, retErr)
 		return nil, retErr
 	}
 	defer rows.Close()
-	defer func() { auditQuery(ctx, query, []any{schema, table}, started, len(columns), retErr) }()
+	defer func() { auditQuery(queryCtx, query, []any{schema, table}, started, len(columns), retErr) }()
 
 	columns = make([]Column, 0)
 
@@ -237,15 +246,15 @@ func ListSchemas(ctx context.Context, db *sql.DB) (schemas []Schema, retErr erro
 		AND schema_name NOT LIKE 'pg_temp_%%'
 		ORDER BY schema_name
 	`
-	started := startAuditQuery(ctx, query, nil)
+	queryCtx, started := startAuditQuery(ctx, query, nil)
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		retErr = wrapQueryError("list schemas", err)
-		auditQuery(ctx, query, nil, started, 0, retErr)
+		auditQuery(queryCtx, query, nil, started, 0, retErr)
 		return nil, retErr
 	}
 	defer rows.Close()
-	defer func() { auditQuery(ctx, query, nil, started, len(schemas), retErr) }()
+	defer func() { auditQuery(queryCtx, query, nil, started, len(schemas), retErr) }()
 
 	schemas = make([]Schema, 0)
 
@@ -298,15 +307,15 @@ func ListConstraints(ctx context.Context, db *sql.DB, schema string, table strin
         ORDER BY c.conname
     `
 
-	started := startAuditQuery(ctx, query, []any{schema, table})
+	queryCtx, started := startAuditQuery(ctx, query, []any{schema, table})
 	rows, err := db.QueryContext(ctx, query, schema, table)
 	if err != nil {
 		retErr = wrapQueryError("list table constraints", err)
-		auditQuery(ctx, query, []any{schema, table}, started, 0, retErr)
+		auditQuery(queryCtx, query, []any{schema, table}, started, 0, retErr)
 		return nil, retErr
 	}
 	defer rows.Close()
-	defer func() { auditQuery(ctx, query, []any{schema, table}, started, len(constraints), retErr) }()
+	defer func() { auditQuery(queryCtx, query, []any{schema, table}, started, len(constraints), retErr) }()
 
 	constraints = make([]Constraint, 0)
 
@@ -354,15 +363,15 @@ func ListIndexes(ctx context.Context, db *sql.DB, schema string, table string) (
 			AND tbl.relname = $2
 		ORDER BY idx.relname
 	`
-	started := startAuditQuery(ctx, query, []any{schema, table})
+	queryCtx, started := startAuditQuery(ctx, query, []any{schema, table})
 	rows, err := db.QueryContext(ctx, query, schema, table)
 	if err != nil {
 		retErr = wrapQueryError("list indexes", err)
-		auditQuery(ctx, query, []any{schema, table}, started, 0, retErr)
+		auditQuery(queryCtx, query, []any{schema, table}, started, 0, retErr)
 		return nil, retErr
 	}
 	defer rows.Close()
-	defer func() { auditQuery(ctx, query, []any{schema, table}, started, len(indexes), retErr) }()
+	defer func() { auditQuery(queryCtx, query, []any{schema, table}, started, len(indexes), retErr) }()
 
 	indexes = make([]Index, 0)
 
@@ -440,13 +449,13 @@ func ReadTableData(ctx context.Context, db *sql.DB, schema string, table string,
 
 	// Menghitung total baris untuk informasi pagination.
 	countQuery := "SELECT COUNT(*) FROM " + qualifiedTable
-	countStarted := startAuditQuery(ctx, countQuery, nil)
+	countQueryCtx, countStarted := startAuditQuery(ctx, countQuery, nil)
 	countErr := tx.QueryRowContext(ctx, countQuery).Scan(&result.TotalRows)
 	countRows := 0
 	if countErr == nil {
 		countRows = 1
 	}
-	auditQuery(ctx, countQuery, nil, countStarted, countRows, countErr)
+	auditQuery(countQueryCtx, countQuery, nil, countStarted, countRows, countErr)
 	if countErr != nil {
 		return TableData{}, wrapQueryError("count table rows", countErr)
 	}
@@ -484,15 +493,15 @@ func ReadTableData(ctx context.Context, db *sql.DB, schema string, table string,
 	offset := (page - 1) * pageSize
 	query += " LIMIT $1 OFFSET $2"
 
-	queryStarted := startAuditQuery(ctx, query, []any{pageSize, offset})
+	queryCtx, queryStarted := startAuditQuery(ctx, query, []any{pageSize, offset})
 	rows, err := tx.QueryContext(ctx, query, pageSize, offset)
 	if err != nil {
 		wrapped := wrapQueryError("read table data", err)
-		auditQuery(ctx, query, []any{pageSize, offset}, queryStarted, 0, wrapped)
+		auditQuery(queryCtx, query, []any{pageSize, offset}, queryStarted, 0, wrapped)
 		return TableData{}, wrapped
 	}
 	defer rows.Close()
-	defer func() { auditQuery(ctx, query, []any{pageSize, offset}, queryStarted, len(result.Rows), retErr) }()
+	defer func() { auditQuery(queryCtx, query, []any{pageSize, offset}, queryStarted, len(result.Rows), retErr) }()
 
 	for rows.Next() {
 		values := make([]any, len(result.Columns))
@@ -542,15 +551,15 @@ func primaryKeyColumns(ctx context.Context, tx *sql.Tx, schema string, table str
         ORDER BY k.ord
     `
 
-	started := startAuditQuery(ctx, query, []any{schema, table})
+	queryCtx, started := startAuditQuery(ctx, query, []any{schema, table})
 	rows, err := tx.QueryContext(ctx, query, schema, table)
 	if err != nil {
 		retErr = wrapQueryError("find primary key columns", err)
-		auditQuery(ctx, query, []any{schema, table}, started, 0, retErr)
+		auditQuery(queryCtx, query, []any{schema, table}, started, 0, retErr)
 		return nil, retErr
 	}
 	defer rows.Close()
-	defer func() { auditQuery(ctx, query, []any{schema, table}, started, len(columns), retErr) }()
+	defer func() { auditQuery(queryCtx, query, []any{schema, table}, started, len(columns), retErr) }()
 
 	columns = make([]string, 0)
 
