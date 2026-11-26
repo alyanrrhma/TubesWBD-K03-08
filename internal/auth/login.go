@@ -9,6 +9,7 @@ import (
 
 type User struct {
 	ID           int64
+	Username     string
 	PasswordHash string
 	Admin        bool
 }
@@ -19,7 +20,7 @@ type PostgresUsers struct{ DB *sql.DB }
 
 func (p PostgresUsers) FindByUsername(ctx context.Context, username string) (User, error) {
 	var u User
-	e := p.DB.QueryRowContext(ctx, `SELECT id,password_hash,is_platform_admin FROM users WHERE username=$1`, username).Scan(&u.ID, &u.PasswordHash, &u.Admin)
+	e := p.DB.QueryRowContext(ctx, `SELECT id,username,password_hash,is_platform_admin FROM users WHERE username=$1`, username).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Admin)
 	return u, e
 }
 

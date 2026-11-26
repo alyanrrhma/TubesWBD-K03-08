@@ -50,6 +50,21 @@ func TestAPIWorkflowUnauthenticatedReturnsJSON401(t *testing.T) {
 	}
 }
 
+func TestMigrationHistoryUsesSeparateRouteFromWorkflowCollection(t *testing.T) {
+	e := newEnv(t)
+	c := e.login("alice")
+
+	resp, body := e.get(c, "/api/databases/100/migration-history?page=1")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, `"items"`) {
+		t.Fatalf("history status=%d body=%s", resp.StatusCode, body)
+	}
+
+	resp, body = apiRequest(t, e, c, http.MethodPost, "/api/databases/100/migrations", `{"sql":"DROP TABLE customers"}`, apiCSRF(t, e, c))
+	if resp.StatusCode != http.StatusBadRequest || len(e.migs.history) != 0 {
+		t.Fatalf("legacy execution status=%d body=%s history=%d", resp.StatusCode, body, len(e.migs.history))
+	}
+}
+
 func TestAPIWorkflowCreateAndValidateInput(t *testing.T) {
 	e := newEnv(t)
 	c := e.login("alice")

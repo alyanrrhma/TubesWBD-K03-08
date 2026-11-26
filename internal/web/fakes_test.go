@@ -49,7 +49,7 @@ func (f *fakeUsers) FindByUsername(_ context.Context, name string) (auth.User, e
 	if !ok {
 		return auth.User{}, sql.ErrNoRows
 	}
-	return auth.User{ID: u.ID, PasswordHash: u.hash, Admin: u.IsAdmin}, nil
+	return auth.User{ID: u.ID, Username: name, PasswordHash: u.hash, Admin: u.IsAdmin}, nil
 }
 
 func (f *fakeUsers) id(name string) int64 { return f.users[name].ID }

@@ -14,13 +14,13 @@ import (
 	"github.com/alyanrrhma/TubesWBD-K02-08/internal/worker"
 )
 
-type apiError struct {
+type apiErrorDetail struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
 type apiEnvelope struct {
-	Data  any       `json:"data,omitempty"`
-	Error *apiError `json:"error,omitempty"`
+	Data  any             `json:"data,omitempty"`
+	Error *apiErrorDetail `json:"error,omitempty"`
 }
 
 func writeAPI(w http.ResponseWriter, status int, data any) {
@@ -33,7 +33,7 @@ func writeAPIError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(apiEnvelope{Error: &apiError{Code: code, Message: message}})
+	_ = json.NewEncoder(w).Encode(apiEnvelope{Error: &apiErrorDetail{Code: code, Message: message}})
 }
 
 func (s *Server) requireAPIAuth(next http.Handler) http.Handler {
@@ -99,7 +99,7 @@ func (s *Server) csrfProtectAPI(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) apiCSRF(w http.ResponseWriter, r *http.Request) {
+func (s *Server) apiCSRFToken(w http.ResponseWriter, r *http.Request) {
 	rc := reqFrom(r.Context())
 	if rc == nil || rc.CSRF == "" {
 		writeAPIError(w, 500, "server_error", "Token keamanan tidak dapat diterbitkan.")
