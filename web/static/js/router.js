@@ -19,14 +19,21 @@ export function startRouter(root, shell) {
   async function render() {
     const path = location.pathname;
     const found = match(path);
-    if (!found) { root.innerHTML = shell("Halaman tidak ditemukan", `<p>Rute <code>${escapeHTML(path)}</code> tidak tersedia.</p>`); return; }
-    try { await found.render(root, found.params); }
-    catch (error) { root.innerHTML = shell("Terjadi kesalahan", `<div class="flash flash-error" role="alert">${escapeHTML(error.message)}</div><button class="btn" data-back>Kembali</button>`); }
+    if (!found) {
+      root.innerHTML = shell(null, "Halaman tidak ditemukan", `<header class="pagehead"><h1>Halaman tidak ditemukan</h1></header><p>Rute <code>${escapeHTML(path)}</code> tidak tersedia.</p>`);
+      return;
+    }
+    try {
+      await found.render(root, found.params);
+      if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
+    } catch (error) {
+      root.innerHTML = shell(null, "Terjadi kesalahan", `<header class="pagehead"><h1>Terjadi kesalahan</h1></header><div class="flash flash-error" role="alert">${escapeHTML(error.message)}</div><button class="btn" data-back>Kembali</button>`);
+    }
   }
   window.addEventListener("popstate", render);
   root.addEventListener("click", (event) => {
     const link = event.target.closest("a[data-link]");
-    if (link && link.origin === location.origin) { event.preventDefault(); navigate(link.pathname + link.search); }
+    if (link && link.origin === location.origin) { event.preventDefault(); navigate(link.pathname + link.search + link.hash); }
   });
   root.addEventListener("click", (event) => {
     if (event.target.closest("[data-back]")) history.back();

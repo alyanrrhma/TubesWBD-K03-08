@@ -9,8 +9,9 @@ export async function adminPage(root,shell,user) {
       request("/api/admin/users"),request("/api/admin/groups"),request("/api/admin/connections")
     ]);
     root.innerHTML=shell(user,"Administrasi",`
+      <h1>Administrasi</h1>
       ${message?`<p class="flash" role="status">${escapeHTML(message)}</p>`:""}
-      <section><h2>Pengguna</h2>
+      <section id="users"><h2>Pengguna</h2>
         <form id="create-user" class="inline-form">
           <label>Username<input name="username" required minlength="3" maxlength="64"></label>
           <label>Password<input name="password" type="password" required minlength="8"></label>
@@ -21,13 +22,13 @@ export async function adminPage(root,shell,user) {
         ${users.map(u=>`<tr><td>${escapeHTML(u.Username)}</td><td>${u.IsAdmin?"Admin":"User"}</td><td>${u.ID===user.id?"Akun aktif":`<button class="btn-danger" data-delete-user="${u.ID}">Hapus</button>`}</td></tr>`).join("")}
         </tbody></table></div>
       </section>
-      <section><h2>Group</h2>
+      <section id="groups"><h2>Group</h2>
         <form id="create-group" class="inline-form"><label>Nama group<input name="name" required maxlength="64"></label><button class="btn">Buat group</button></form>
         <div class="table-wrap"><table><thead><tr><th>Nama</th><th>Anggota</th></tr></thead><tbody>
         ${groups.map(g=>`<tr><td>${escapeHTML(g.Name)}</td><td>${g.MemberCount}</td></tr>`).join("")}
         </tbody></table></div>
       </section>
-      <section><h2>Koneksi database</h2>
+      <section id="connections"><h2>Koneksi database</h2>
         <form id="create-connection" class="inline-form connection-form">
           <label>Nama koneksi<input name="name" required></label><label>Host<input name="host" required></label>
           <label>Port<input name="port" type="number" value="5432" required></label><label>Database<input name="database" required></label>

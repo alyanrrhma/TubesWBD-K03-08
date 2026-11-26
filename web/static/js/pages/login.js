@@ -1,12 +1,15 @@
 import { request, setCSRF } from "../api/client.js";
 export function loginPage(root, shell) {
-  root.innerHTML = shell(null, "Masuk", `<p class="lede">Masuk ke Database Management Platform.</p>
+  root.innerHTML = shell(null, "Masuk", `<section class="login">
+    <h1>Masuk</h1>
+    <p class="lede">Gunakan akun yang diberikan Platform Admin.</p>
     <form id="login-form" class="panel form-stack">
-      <label>Username<input name="username" autocomplete="username" required maxlength="64"></label>
+      <label>Username<input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="64"></label>
       <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
       <p id="login-error" class="flash flash-error" role="alert" hidden></p>
       <button class="btn" type="submit">Masuk</button>
-    </form>`);
+    </form>
+  </section>`);
   root.querySelector("#login-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget, button = form.querySelector("button"), error = root.querySelector("#login-error");
