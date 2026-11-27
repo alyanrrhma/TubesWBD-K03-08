@@ -4,6 +4,11 @@ import { loading } from "../components/layout.js";
 
 export async function adminPage(root,shell,user) {
   root.innerHTML=shell(user,"Administrasi",loading);
+  const accessLevelLabel = level => {
+    if (level === 2 || level === "VIEW_EDIT") return "View + Edit";
+    if (level === 1 || level === "VIEW_ONLY") return "View Only";
+    return "Unknown";
+  };
   async function draw(message="") {
     const [users,groups,connections]=await Promise.all([
       request("/api/admin/users"),request("/api/admin/groups"),request("/api/admin/connections")
@@ -55,6 +60,8 @@ export async function adminPage(root,shell,user) {
         const group = detail.group;
         const members = detail.members || [];
         const candidates = detail.candidates || [];
+        const accessRows = detail.access || [];
+        const connections = detail.connections || [];
         const countCell = root.querySelector(`[data-group-count="${groupID}"]`);
         if (countCell) countCell.textContent = group.MemberCount;
         const leaderID = leaderResponse.leader?.leader_user_id;
@@ -67,6 +74,38 @@ export async function adminPage(root,shell,user) {
           <p>${leaderID == null
             ? "Belum ada leader. Migration yang memakai group ini belum dapat diajukan untuk review."
             : `Leader saat ini: ${escapeHTML(leader?.Username || `User ID ${leaderID}`)}`}</p>
+          <h4>Akses database</h4>
+          ${accessRows.length ? `
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Database</th><th>Level</th><th>Aksi</th></tr></thead>
+                <tbody>${accessRows.map(access => `
+                  <tr data-group-access-row="${access.DatabaseID}">
+                    <td>${escapeHTML(access.DatabaseName)}</td>
+                    <td>${accessLevelLabel(access.Level)}</td>
+                    <td><button class="btn-danger" type="button" data-revoke-group-access="${access.DatabaseID}">Cabut akses</button></td>
+                  </tr>`).join("")}</tbody>
+              </table>
+            </div>` : "<p>Group ini belum punya akses ke database mana pun.</p>"}
+          ${connections.length ? `
+            <form id="group-access-form" class="inline-form">
+              <label for="group-access-database">Database
+                <select id="group-access-database" name="database_id" required>
+                  ${connections.map(connection => {
+                    const current = accessRows.find(access => access.DatabaseID === connection.ID);
+                    return `<option value="${connection.ID}">${escapeHTML(connection.Name)}${current ? ` (akses saat ini: ${accessLevelLabel(current.Level)})` : ""}</option>`;
+                  }).join("")}
+                </select>
+              </label>
+              <label for="group-access-level">Level akses
+                <select id="group-access-level" name="level" required>
+                  <option value="VIEW_ONLY">View Only</option>
+                  <option value="VIEW_EDIT">View + Edit</option>
+                </select>
+              </label>
+              <button class="btn" type="submit">Simpan akses</button>
+            </form>
+            <p class="muted">Menyimpan akses pada database yang sudah terdaftar akan memperbarui levelnya. Jika pengguna ada di beberapa group, akses tertinggi yang berlaku.</p>` : "<p class=\"muted\">Belum ada koneksi database.</p>"}
           <h4>Anggota group</h4>
           ${members.length
             ? `<ul>${members.map(member => `<li>${escapeHTML(member.Username)}${member.ID === leaderID ? " — leader approval" : ""}</li>`).join("")}</ul>`
@@ -88,6 +127,40 @@ export async function adminPage(root,shell,user) {
               <button class="btn" type="submit">${leaderID == null ? "Tetapkan leader" : "Simpan leader"}</button>
             </form>` : `<p>Group ini belum memiliki anggota untuk dijadikan leader.</p>`}
           <p class="muted">Perubahan leader hanya berlaku untuk review baru. Review yang sedang berjalan memakai snapshot leader saat diajukan.</p>`;
+        const accessForm = groupDetails.querySelector("#group-access-form");
+        if (accessForm) {
+          accessForm.addEventListener("submit", async event => {
+            event.preventDefault();
+            const formData = Object.fromEntries(new FormData(accessForm));
+            const submit = accessForm.querySelector("button");
+            submit.disabled = true;
+            try {
+              await request(`/api/admin/groups/${groupID}/access`, {
+                method: "POST",
+                body: { database_id: Number(formData.database_id), level: formData.level },
+              });
+              await showGroupDetails(groupID, "Akses database berhasil disimpan.");
+            } catch (error) {
+              groupDetails.insertAdjacentHTML("afterbegin", `<p class="flash flash-error" role="alert">${escapeHTML(error.message)}</p>`);
+              submit.disabled = false;
+            }
+          });
+        }
+        groupDetails.querySelectorAll("[data-revoke-group-access]").forEach(button => {
+          button.addEventListener("click", async () => {
+            const databaseID = Number(button.dataset.revokeGroupAccess);
+            const access = accessRows.find(row => row.DatabaseID === databaseID);
+            if (!confirm(`Cabut akses ${access?.DatabaseName || "database ini"} dari group?`)) return;
+            button.disabled = true;
+            try {
+              await request(`/api/admin/groups/${groupID}/access/${databaseID}`, { method: "DELETE" });
+              await showGroupDetails(groupID, "Akses database berhasil dicabut.");
+            } catch (error) {
+              groupDetails.insertAdjacentHTML("afterbegin", `<p class="flash flash-error" role="alert">${escapeHTML(error.message)}</p>`);
+              button.disabled = false;
+            }
+          });
+        });
         const memberForm = groupDetails.querySelector("#group-member-form");
         if (memberForm) {
           memberForm.addEventListener("submit", async event => {

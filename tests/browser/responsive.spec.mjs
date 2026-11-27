@@ -128,8 +128,9 @@ test("authenticated SPA pages remain usable at configured viewport", async ({ pa
 
   if (targetDatabase && isAdmin) {
     const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const connectionName = `browser_${suffix}`;
     const connectionResponse = await api(page, "POST", "/api/admin/connections", {
-      name: `browser_${suffix}`,
+      name: connectionName,
       host: process.env.BROWSER_TARGET_HOST || "127.0.0.1",
       port: Number(process.env.BROWSER_TARGET_PORT || 55432),
       database: targetDatabase,
@@ -145,7 +146,6 @@ test("authenticated SPA pages remain usable at configured viewport", async ({ pa
     const session = await api(page, "GET", "/api/auth/me");
     await api(page, "POST", `/api/admin/groups/${groupID}/members`, { user_id: session.user.id });
     await api(page, "PUT", `/api/admin/groups/${groupID}/leader`, { user_id: session.user.id });
-    await api(page, "POST", `/api/admin/groups/${groupID}/access`, { database_id: connectionID, level: "VIEW_EDIT" });
 
     const helperUsername = `member_${suffix}`;
     const helperUserResponse = await api(page, "POST", "/api/admin/users", {
@@ -158,6 +158,30 @@ test("authenticated SPA pages remain usable at configured viewport", async ({ pa
     const groupRow = page.getByRole("row").filter({ hasText: `browser_${suffix}` });
     await groupRow.getByRole("button", { name: "Atur group" }).click();
     const groupDetails = page.locator("#group-details");
+    const accessForm = groupDetails.locator("#group-access-form");
+    await accessForm.locator('[name="database_id"]').selectOption(String(connectionID));
+    await accessForm.locator('[name="level"]').selectOption("VIEW_ONLY");
+    await accessForm.getByRole("button", { name: "Simpan akses" }).click();
+    await expect(groupDetails.getByText("Akses database berhasil disimpan.")).toBeVisible();
+    const accessRow = groupDetails.locator(`[data-group-access-row="${connectionID}"]`);
+    await expect(accessRow).toContainText(connectionName);
+    await expect(accessRow).toContainText("View Only");
+
+    await groupDetails.locator("#group-access-form [name='database_id']").selectOption(String(connectionID));
+    await groupDetails.locator("#group-access-form [name='level']").selectOption("VIEW_EDIT");
+    await groupDetails.locator("#group-access-form").getByRole("button", { name: "Simpan akses" }).click();
+    await expect(groupDetails.locator(`[data-group-access-row="${connectionID}"]`)).toContainText("View + Edit");
+
+    await page.once("dialog", dialog => dialog.accept());
+    await groupDetails.locator(`[data-revoke-group-access="${connectionID}"]`).click();
+    await expect(groupDetails.locator(`[data-group-access-row="${connectionID}"]`)).toHaveCount(0);
+
+    await groupDetails.locator("#group-access-form [name='database_id']").selectOption(String(connectionID));
+    await groupDetails.locator("#group-access-form [name='level']").selectOption("VIEW_EDIT");
+    await groupDetails.locator("#group-access-form").getByRole("button", { name: "Simpan akses" }).click();
+    await expect(groupDetails.locator(`[data-group-access-row="${connectionID}"]`)).toContainText("View + Edit");
+    await expectNoViewportOverflow(page);
+
     await groupDetails.locator("#group-member").selectOption(String(helperUser.ID ?? helperUser.id));
     await groupDetails.getByRole("button", { name: "Tambahkan anggota" }).click();
     await expect(groupDetails.getByRole("list").getByText(helperUsername)).toBeVisible();
