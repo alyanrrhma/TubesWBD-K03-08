@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/alyanrrhma/TubesWBD-K02-08/internal/telemetry"
 	"log/slog"
 	"strings"
 	"sync"
@@ -80,12 +81,12 @@ func (s *Service) Execute(ctx context.Context, userID, databaseID int64, sqlText
 		return Migration{}, fmt.Errorf("%w: begin transaction: %v", database.ErrConnectFailed, err)
 	}
 	started := time.Now()
-	slog.InfoContext(opCtx, "migration_sql_started", "actor_id", userID, "database_id", databaseID, "query", sqlText, "parameters", []any{})
+	slog.InfoContext(opCtx, "migration_sql_started", "actor_id", userID, "database_id", databaseID, "query", telemetry.SafeSQL(sqlText), "parameters", []any{})
 	applyErr := applyInTx(opCtx, tx, sqlText)
 	if applyErr != nil {
-		slog.ErrorContext(opCtx, "migration_sql_finished", "actor_id", userID, "database_id", databaseID, "status", "failed", "query", sqlText, "duration_ms", time.Since(started).Milliseconds(), "error", applyErr, "sqlstate", migrationSQLState(applyErr))
+		slog.ErrorContext(opCtx, "migration_sql_finished", "actor_id", userID, "database_id", databaseID, "status", "failed", "query", telemetry.SafeSQL(sqlText), "duration_ms", time.Since(started).Milliseconds(), "error", applyErr, "sqlstate", migrationSQLState(applyErr))
 	} else {
-		slog.InfoContext(opCtx, "migration_sql_finished", "actor_id", userID, "database_id", databaseID, "status", "success", "query", sqlText, "duration_ms", time.Since(started).Milliseconds())
+		slog.InfoContext(opCtx, "migration_sql_finished", "actor_id", userID, "database_id", databaseID, "status", "success", "query", telemetry.SafeSQL(sqlText), "duration_ms", time.Since(started).Milliseconds())
 	}
 	// Susun riwayat berdasarkan hasil transaksi target.
 	rec := Migration{
@@ -166,14 +167,14 @@ func (s *Service) Explain(ctx context.Context, userID, databaseID int64, sqlText
 		}
 		query = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sqlText
 		if err := tx.QueryRowContext(opCtx, query).Scan(&plan); err != nil {
-			slog.ErrorContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", query, "status", "failed", "duration_ms", time.Since(started).Milliseconds(), "error", err, "sqlstate", migrationSQLState(err))
+			slog.ErrorContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", telemetry.SafeSQL(query), "status", "failed", "duration_ms", time.Since(started).Milliseconds(), "error", err, "sqlstate", migrationSQLState(err))
 			return "", fmt.Errorf("explain analyze migration SQL: %s", describeError(err))
 		}
 	} else if err := target.QueryRowContext(opCtx, query).Scan(&plan); err != nil {
-		slog.ErrorContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", query, "status", "failed", "duration_ms", time.Since(started).Milliseconds(), "error", err, "sqlstate", migrationSQLState(err))
+		slog.ErrorContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", telemetry.SafeSQL(query), "status", "failed", "duration_ms", time.Since(started).Milliseconds(), "error", err, "sqlstate", migrationSQLState(err))
 		return "", fmt.Errorf("explain migration SQL: %s", describeError(err))
 	}
-	slog.InfoContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", query, "status", "success", "duration_ms", time.Since(started).Milliseconds())
+	slog.InfoContext(opCtx, "migration_explain_finished", "actor_id", userID, "database_id", databaseID, "query", telemetry.SafeSQL(query), "status", "success", "duration_ms", time.Since(started).Milliseconds())
 	var pretty bytes.Buffer
 	if err := json.Indent(&pretty, plan, "", "  "); err != nil {
 		return string(plan), nil

@@ -123,6 +123,15 @@ func (w *Worker) claim(ctx context.Context) (claimed *Job, retErr error) {
 	err = row.Scan(&j.ID, &j.ExecutionID, &j.OperationReviewID, &j.DatabaseID, &j.MigrationID, &j.Revision, &j.ActorID, &j.Operation, &j.Mode,
 		&j.SQL, &j.ReverseSQL, &j.BatchTable, &j.BatchSize, &j.SourceExecutionID, &j.Traceparent, &j.MaxAttempts, &j.Attempt, &j.BatchesDone, &j.RowsDone, &j.QueueWaitMS)
 	if errors.Is(err, sql.ErrNoRows) {
+		// No job is eligible for execution, but the transaction may
+		// have marked expired jobs as uncertain and closed their attempts.
+		// Commit those recovery updates before returning.
+		if commitErr := tx.Commit(); commitErr != nil {
+			return nil, fmt.Errorf(
+				"commit stale job recovery: %w",
+				commitErr,
+			)
+		}
 		return nil, nil
 	}
 	if err != nil {
@@ -163,7 +172,7 @@ func (w *Worker) process(ctx context.Context, j Job) error {
 	log := w.logger().With("job_id", j.ID, "execution_id", j.ExecutionID, "migration_id", j.MigrationID,
 		"revision", j.Revision, "database", j.DatabaseID, "actor", j.ActorID, "attempt", j.Attempt, "operation", j.Operation,
 		"trace_id", telemetry.TraceID(ctx), "span_id", telemetry.SpanID(ctx))
-	log.Info("job_started", "status", "running", "sql_text", effectiveSQL(j))
+	log.Info("job_started", "status", "running", "sql_text", telemetry.SafeSQL(effectiveSQL(j)))
 	if err := j.Validate(); err != nil {
 		return w.finish(ctx, j, err, false)
 	}
@@ -278,11 +287,11 @@ func (w *Worker) normal(ctx context.Context, c *sql.Conn, j Job, log *slog.Logge
 	defer tx.Rollback()
 	started := time.Now()
 	w.crashAt("before_sql")
-	log.Info("sql_started", "batch", 0, "query", statement, "parameters", []any{})
+	log.Info("sql_started", "batch", 0, "query", telemetry.SafeSQL(statement), "parameters", []any{})
 	if err = w.markSQLStarted(ctx, j); err != nil {
 		return err
 	}
-	sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.sql", map[string]any{"operation": j.Operation, "mode": j.Mode, "batch": 0, "query": statement})
+	sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.sql", map[string]any{"operation": j.Operation, "mode": j.Mode, "batch": 0, "query": telemetry.SafeSQL(statement)})
 	res, err := tx.ExecContext(sqlCtx, statement)
 	endSQL(err)
 	if err != nil {
@@ -400,11 +409,11 @@ func (w *Worker) batches(ctx context.Context, c *sql.Conn, j Job, log *slog.Logg
 			return e
 		}
 		scanQuery := `SELECT id FROM "` + j.BatchTable + `" WHERE id>$1::bigint AND id<=$2::bigint ORDER BY id LIMIT $3::integer`
-		log.Info("sql_query_started", "query", scanQuery, "parameters", []any{cursor, upper, j.BatchSize})
+		log.Info("sql_query_started", "query", telemetry.SafeSQL(scanQuery), "parameters", telemetry.SafeParams([]any{cursor, upper, j.BatchSize}))
 		startedScan := time.Now()
 		ids, e := selectIDs(ctx, tx, j.BatchTable, cursor, upper, j.BatchSize)
-		log.Info("sql_query_finished", "query", scanQuery,
-			"parameters", []any{cursor, upper, j.BatchSize}, "duration", time.Since(startedScan), "row_count", len(ids), "status", map[bool]string{true: "error", false: "success"}[e != nil], "error", e, "sqlstate", sqlState(e))
+		log.Info("sql_query_finished", "query", telemetry.SafeSQL(scanQuery),
+			"parameters", telemetry.SafeParams([]any{cursor, upper, j.BatchSize}), "duration", time.Since(startedScan), "row_count", len(ids), "status", map[bool]string{true: "error", false: "success"}[e != nil], "error", e, "sqlstate", sqlState(e))
 		if e != nil {
 			rollbackBatch(ctx, tx, log, next, e)
 			return e
@@ -416,12 +425,12 @@ func (w *Worker) batches(ctx context.Context, c *sql.Conn, j Job, log *slog.Logg
 		}
 		started := time.Now()
 		w.crashAt("before_sql")
-		log.Info("sql_started", "batch", next, "selected_rows", len(ids), "query", j.SQL, "parameter_count", len(ids), "parameters_redacted", true)
+		log.Info("sql_started", "batch", next, "selected_rows", len(ids), "query", telemetry.SafeSQL(j.SQL), "parameter_count", 1, "parameters", telemetry.SafeParams([]any{ids}), "parameters_redacted", true)
 		if e = w.markSQLStarted(ctx, j); e != nil {
 			rollbackBatch(ctx, tx, log, next, e)
 			return e
 		}
-		sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.batch", map[string]any{"batch": next, "rows": len(ids), "query": j.SQL})
+		sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.batch", map[string]any{"batch": next, "rows": len(ids), "query": telemetry.SafeSQL(j.SQL)})
 		res, e := tx.ExecContext(sqlCtx, j.SQL, ids)
 		endSQL(e)
 		if e != nil {
@@ -518,13 +527,13 @@ func (w *Worker) reverseBatches(ctx context.Context, c *sql.Conn, j Job, log *sl
 		if e != nil {
 			return e
 		}
-		log.Info("compensation_started", "batch", b.n, "selected_rows", len(b.ids), "query", j.ReverseSQL, "parameter_count", len(b.ids), "parameters_redacted", true)
+		log.Info("compensation_started", "batch", b.n, "selected_rows", len(b.ids), "query", telemetry.SafeSQL(j.ReverseSQL), "parameter_count", 1, "parameters", telemetry.SafeParams([]any{b.ids}), "parameters_redacted", true)
 		w.crashAt("rollback_before_sql")
 		if e = w.markSQLStarted(ctx, j); e != nil {
 			rollbackBatch(ctx, tx, log, b.n, e)
 			return e
 		}
-		sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.compensate", map[string]any{"batch": b.n, "rows": len(b.ids), "query": j.ReverseSQL})
+		sqlCtx, endSQL := telemetry.Start(ctx, "db.migration.compensate", map[string]any{"batch": b.n, "rows": len(b.ids), "query": telemetry.SafeSQL(j.ReverseSQL)})
 		res, e := tx.ExecContext(sqlCtx, j.ReverseSQL, b.ids)
 		endSQL(e)
 		if e != nil {

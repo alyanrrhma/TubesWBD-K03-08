@@ -539,7 +539,21 @@ func (r WorkflowRepository) ReviewStatus(ctx context.Context, definitionID int64
 	if err := rows.Err(); err != nil {
 		return s, err
 	}
+	// Release the read connection before checking the current approval snapshot.
+	// This also supports repositories configured with a single open connection.
+	if err := rows.Close(); err != nil {
+		return s, err
+	}
 	s.Ready = s.Status == WorkflowApproved && s.RequiredApprovals > 0 && s.CompletedApprovals == s.RequiredApprovals && s.MissingLeaders == 0
+	if s.Ready {
+		// An approval snapshot remains immutable, but it is no longer ready
+		// when a group grant, access level, leader or leader membership changes.
+		current, checkErr := r.approvalSnapshotCurrent(ctx, s.RevisionID)
+		if checkErr != nil {
+			return s, checkErr
+		}
+		s.Ready = current
+	}
 	return s, nil
 }
 
@@ -860,7 +874,42 @@ func (r WorkflowRepository) ApprovedRevision(ctx context.Context, definitionID i
 	if !complete {
 		return v, ErrApprovalIncomplete
 	}
+	current, err := r.approvalSnapshotCurrent(ctx, v.ID)
+	if err != nil {
+		return v, err
+	}
+	if !current {
+		return v, ErrApprovalIncomplete
+	}
 	return v, nil
+}
+
+// approvalSnapshotCurrent compares the immutable review-group snapshot to all
+// current database grants (including VIEW_ONLY), group leaders and membership.
+// A mismatched snapshot needs a fresh review, not silent re-approval.
+func (r WorkflowRepository) approvalSnapshotCurrent(ctx context.Context, revisionID int64) (bool, error) {
+	var current bool
+	err := r.DB.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM migration_review_groups WHERE revision_id=$1)
+		AND (SELECT COUNT(*) FROM migration_review_groups WHERE revision_id=$1) =
+		    (SELECT COUNT(*) FROM group_database_access ga
+		     JOIN migration_revisions mr ON mr.id=$1
+		     JOIN migration_definitions md ON md.id=mr.definition_id
+		     WHERE ga.database_id=md.database_id)
+		AND NOT EXISTS(
+		 SELECT 1 FROM migration_review_groups rg
+		 JOIN migration_revisions mr ON mr.id=rg.revision_id
+		 JOIN migration_definitions md ON md.id=mr.definition_id
+		 LEFT JOIN group_database_access ga ON ga.group_id=rg.group_id AND ga.database_id=md.database_id
+		 LEFT JOIN app_groups g ON g.id=rg.group_id
+		 WHERE rg.revision_id=$1 AND (
+		  ga.group_id IS NULL OR rg.access_level IS DISTINCT FROM ga.access_level
+		  OR rg.leader_user_id IS DISTINCT FROM g.leader_user_id
+		  OR NOT EXISTS(SELECT 1 FROM user_groups ug
+		                WHERE ug.group_id=rg.group_id AND ug.user_id=rg.leader_user_id)
+		 )
+		)`, revisionID).Scan(&current)
+	return current, err
 }
 
 func (r WorkflowRepository) MarkExecuted(ctx context.Context, definitionID, revisionID int64, executionID string) (MigrationRevision, error) {

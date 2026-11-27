@@ -616,3 +616,165 @@ func TestWorkerPGLostLeaseStopsBeforeSubmittingSQL(t *testing.T) {
 		t.Fatalf("stale worker wrote history=%d err=%v", history, err)
 	}
 }
+
+// A stale final attempt is not eligible for an unsafe blind replay. It must
+// become uncertain and fence subsequent jobs for the registered database.
+func TestWorkerPGUncertainExhaustedLeaseBlocksFollowingJob(t *testing.T) {
+	f := workerPGSetup(t)
+	if _, err := f.target.Exec(`CREATE TABLE "` + f.table + `" (id bigint PRIMARY KEY, value integer NOT NULL DEFAULT 0); INSERT INTO "` + f.table + `" VALUES (1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	first := f.enqueue(t, Forward, Normal, `UPDATE "`+f.table+`" SET value=value+1 WHERE id=1`, "", "", 0)
+	// Simulate a worker whose last attempt died while the target commit outcome
+	// cannot yet be determined. The stale claim must be fenced, not replayed.
+	if _, err := f.platform.Exec(`UPDATE migration_jobs SET status='running',attempt=max_attempts,heartbeat_at=NOW()-INTERVAL '10 minutes' WHERE id=$1`, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.platform.Exec(`INSERT INTO migration_job_attempts
+        (job_id,attempt,execution_id,migration_id,revision,actor_id,operation,sql_text)
+        SELECT id,max_attempts,execution_id,migration_id,revision,actor_id,operation,sql_text
+        FROM migration_jobs WHERE id=$1`, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	second := f.enqueue(t, Forward, Normal, `UPDATE "`+f.table+`" SET value=value+10 WHERE id=1`, "", "", 0)
+	f.runOnce(t)
+	status, attempts, _, _ := f.state(t, first)
+	if status != Uncertain || attempts < 1 {
+		t.Fatalf("stale final attempt: status=%s attempts=%d", status, attempts)
+	}
+	var outcome string
+	if err := f.platform.QueryRow(`SELECT outcome FROM migration_job_attempts WHERE job_id=$1 AND attempt=$2`, first.ID, attempts).Scan(&outcome); err != nil || outcome != "uncertain" {
+		t.Fatalf("uncertain attempt audit missing: outcome=%s err=%v", outcome, err)
+	}
+	status2, attempts2, _, _ := f.state(t, second)
+	if status2 != Pending || attempts2 != 0 {
+		t.Fatalf("next job must be blocked: status=%s attempts=%d", status2, attempts2)
+	}
+	var value int
+	if err := f.target.QueryRow(`SELECT value FROM "` + f.table + `" WHERE id=1`).Scan(&value); err != nil || value != 0 {
+		t.Fatalf("queue unexpectedly executed SQL: value=%d err=%v", value, err)
+	}
+	f.runOnce(t)
+	status2, _, _, _ = f.state(t, second)
+	if status2 != Pending {
+		t.Fatalf("subsequent poll bypassed uncertain fence: %s", status2)
+	}
+}
+
+// This test requires two *distinct physical target databases*. It verifies
+// that two registered DB IDs can execute SQL concurrently on independent
+// PostgreSQL backends, rather than merely asserting that per-ID locks exist.
+func TestWorkerPGDifferentDatabasesRunInParallel(t *testing.T) {
+	secondDSN := os.Getenv("WORKER_TEST_SECOND_TARGET_DATABASE_URL")
+	if secondDSN == "" {
+		t.Skip("set WORKER_TEST_SECOND_TARGET_DATABASE_URL to a different disposable *_test database")
+	}
+	firstDSN := requireWorkerTestDSN(t, "WORKER_TEST_TARGET_DATABASE_URL")
+	if secondDSN == firstDSN {
+		t.Fatal("second target must be physically distinct")
+	}
+	parsed, err := url.Parse(secondDSN)
+	if err != nil || !strings.HasSuffix(strings.TrimPrefix(parsed.Path, "/"), "_test") || strings.TrimPrefix(parsed.Path, "/") == strings.TrimPrefix(mustParseURL(t, firstDSN).Path, "/") {
+		t.Fatal("second target must have a different disposable *_test database name")
+	}
+	f := workerPGSetup(t)
+	second, err := sql.Open("pgx", secondDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := second.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tag, err := newID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondID int64
+	if err := f.platform.QueryRow(`INSERT INTO database_connections(name) VALUES($1) RETURNING id`, "parallel_db_"+tag[:12]).Scan(&secondID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = f.platform.Exec(`DELETE FROM database_connections WHERE id=$1`, secondID) })
+	table2 := "parallel_worker_" + tag[:12]
+	for _, fixture := range []struct {
+		db    *sql.DB
+		table string
+	}{{f.target, f.table}, {second, table2}} {
+		if _, err := fixture.db.Exec(`CREATE TABLE "` + fixture.table + `" (id bigint PRIMARY KEY, started_at timestamptz, finished_at timestamptz); INSERT INTO "` + fixture.table + `" (id) VALUES (1)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _, _ = second.Exec(`DROP TABLE IF EXISTS "` + table2 + `"`) })
+	// Instead record execution overlap by measuring worker attempt timestamps.
+	sql1 := `SELECT pg_sleep(1.5)`
+	sql2 := `SELECT pg_sleep(1.5)`
+	j1 := f.enqueue(t, Forward, Normal, sql1, "", "", 0)
+	j2, err := Enqueue(context.Background(), f.platform, Job{DatabaseID: secondID, MigrationID: 1, Revision: 1, ActorID: f.userID, Operation: Forward, Mode: Normal, SQL: sql2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.platform.Exec(`DELETE FROM migration_job_attempts WHERE job_id=$1`, j2.ID)
+		_, _ = f.platform.Exec(`DELETE FROM migration_worker_history WHERE job_id=$1`, j2.ID)
+		_, _ = f.platform.Exec(`DELETE FROM migration_jobs WHERE id=$1`, j2.ID)
+	})
+	resolver := TargetResolverFunc(func(id int64) (*sql.DB, error) {
+		if id == f.databaseID {
+			return f.target, nil
+		}
+		if id == secondID {
+			return second, nil
+		}
+		return nil, fmt.Errorf("unknown db %d", id)
+	})
+	validator := ValidatorFunc(func(_ context.Context, j Job) error {
+		if j.ActorID != f.userID {
+			return ErrUnapproved
+		}
+		return nil
+	})
+	a := &Worker{Platform: f.platform, Targets: resolver, Validator: validator, DatabaseID: f.databaseID}
+	b := &Worker{Platform: f.platform, Targets: resolver, Validator: validator, DatabaseID: secondID}
+	results := make(chan error, 2)
+	go func() { results <- a.RunOnce(ctx) }()
+	go func() { results <- b.RunOnce(ctx) }()
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, j := range []Job{j1, j2} {
+		var status Status
+		var started, ended time.Time
+		if err := f.platform.QueryRow(`SELECT status FROM migration_jobs WHERE id=$1`, j.ID).Scan(&status); err != nil || status != Success {
+			t.Fatalf("job %s status=%s err=%v", j.ID, status, err)
+		}
+		if err := f.platform.QueryRow(`SELECT started_at,ended_at FROM migration_job_attempts WHERE job_id=$1 AND attempt=1`, j.ID).Scan(&started, &ended); err != nil {
+			t.Fatal(err)
+		}
+		if !ended.After(started) {
+			t.Fatalf("invalid attempt interval for %s", j.ID)
+		}
+	}
+	var aStart, aEnd, bStart, bEnd time.Time
+	if err := f.platform.QueryRow(`SELECT started_at,ended_at FROM migration_job_attempts WHERE job_id=$1`, j1.ID).Scan(&aStart, &aEnd); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.platform.QueryRow(`SELECT started_at,ended_at FROM migration_job_attempts WHERE job_id=$1`, j2.ID).Scan(&bStart, &bEnd); err != nil {
+		t.Fatal(err)
+	}
+	if !aStart.Before(bEnd) || !bStart.Before(aEnd) {
+		t.Fatalf("no execution overlap: db1=%s..%s db2=%s..%s", aStart, aEnd, bStart, bEnd)
+	}
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	v, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}

@@ -26,10 +26,10 @@ func WithQueryAuditContext(ctx context.Context, actorID, databaseID int64) conte
 
 func startAuditQuery(ctx context.Context, query string, parameters []any) (context.Context, time.Time) {
 	meta, _ := ctx.Value(queryAuditKey{}).(queryAuditContext)
-	queryCtx, endSpan := telemetry.Start(ctx, "db.viewer.query", map[string]any{"database_id": meta.databaseID, "query": strings.TrimSpace(query)})
+	queryCtx, endSpan := telemetry.Start(ctx, "db.viewer.query", map[string]any{"database_id": meta.databaseID, "query": telemetry.SafeSQL(query)})
 	queryCtx = context.WithValue(queryCtx, queryAuditSpanKey{}, endSpan)
 	started := time.Now()
-	slog.Default().Info("sql_query_started", "event", "database.sql.read", "actor_id", meta.actorID, "database_id", meta.databaseID, "trace_id", telemetry.TraceID(queryCtx), "span_id", telemetry.SpanID(queryCtx), "query", strings.TrimSpace(query), "parameters", parameters)
+	slog.Default().Info("sql_query_started", "event", "database.sql.read", "actor_id", meta.actorID, "database_id", meta.databaseID, "trace_id", telemetry.TraceID(queryCtx), "span_id", telemetry.SpanID(queryCtx), "query", telemetry.SafeSQL(query), "parameters", telemetry.SafeParams(parameters))
 	return queryCtx, started
 }
 
@@ -37,7 +37,7 @@ func auditQuery(ctx context.Context, query string, parameters []any, started tim
 	meta, _ := ctx.Value(queryAuditKey{}).(queryAuditContext)
 	endSpan, _ := ctx.Value(queryAuditSpanKey{}).(func(error))
 	attrs := []any{"event", "database.sql.read", "actor_id", meta.actorID, "database_id", meta.databaseID,
-		"trace_id", telemetry.TraceID(ctx), "span_id", telemetry.SpanID(ctx), "query", strings.TrimSpace(query), "parameters", parameters, "duration_ms", time.Since(started).Milliseconds(), "row_count", rowCount}
+		"trace_id", telemetry.TraceID(ctx), "span_id", telemetry.SpanID(ctx), "query", telemetry.SafeSQL(query), "parameters", telemetry.SafeParams(parameters), "duration_ms", time.Since(started).Milliseconds(), "row_count", rowCount}
 	if endSpan != nil {
 		endSpan(err)
 	}

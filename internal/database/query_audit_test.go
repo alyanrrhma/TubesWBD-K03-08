@@ -11,6 +11,24 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+func TestAuditQueryRedactsSQLLiteralsAndParameters(t *testing.T) {
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	defer slog.SetDefault(previous)
+	const secret = "private-api-token-123"
+	query := "SELECT * FROM credentials WHERE token='" + secret + "' AND id=$1"
+	ctx := WithQueryAuditContext(context.Background(), 1, 2)
+	queryCtx, started := startAuditQuery(ctx, query, []any{secret})
+	auditQuery(queryCtx, query, []any{secret}, started, 0, nil)
+	if bytes.Contains(output.Bytes(), []byte(secret)) {
+		t.Fatalf("SQL audit log leaked literal or argument value")
+	}
+	if !bytes.Contains(output.Bytes(), []byte("REDACTED")) {
+		t.Fatal("SQL audit log should retain a redacted query/parameter representation")
+	}
+}
+
 func TestAuditQueryEmitsSQLContextAndSQLState(t *testing.T) {
 	var output bytes.Buffer
 	previous := slog.Default()

@@ -227,9 +227,15 @@ func TestWorkflowReviewPartialAndCompleteApproval(t *testing.T) {
 	if err != nil || !complete {
 		t.Fatalf("complete approval complete=%v err=%v", complete, err)
 	}
-	approved, err := f.svc.ApprovedRevision(ctx, d.ID)
-	if err != nil || approved.WorkflowStatus != WorkflowApproved {
-		t.Fatalf("approved=%+v err=%v", approved, err)
+	// Approval decisions remain recorded, but the revision must
+	// not be executable when the current group configuration
+	// differs from the immutable review snapshot.
+	_, err = f.svc.ApprovedRevision(ctx, d.ID)
+	if !errors.Is(err, ErrApprovalIncomplete) {
+		t.Fatalf(
+			"expected ErrApprovalIncomplete after leader/grant changes, got %v",
+			err,
+		)
 	}
 	var count int
 	if err = f.db.QueryRow(`SELECT count(*) FROM migration_approvals WHERE revision_id=$1`, v.ID).Scan(&count); err != nil || count != 2 {
@@ -622,5 +628,31 @@ func TestWorkflowSetGroupLeaderRequiresMembership(t *testing.T) {
 	f := workflowSetup(t, false)
 	if err := f.svc.SetGroupLeader(context.Background(), f.group1, f.nonLeader); !errors.Is(err, ErrLeaderMustBeMember) {
 		t.Fatalf("want ErrLeaderMustBeMember, got %v", err)
+	}
+}
+
+// A previously approved immutable revision is not ready for enqueue after
+// a group grant changes. This must be reflected in both readiness UI and the
+// server-side execution gate, not merely rejected later by the worker.
+func TestWorkflowApprovedReviewReadinessInvalidatedByAccessChange(t *testing.T) {
+	f := workflowSetup(t, true)
+	ctx := context.Background()
+	d, _ := approveMigration(t, f, "grant-change-readiness", false)
+	before, err := f.svc.ReviewStatus(ctx, f.user1, d.ID)
+	if err != nil || !before.Ready {
+		t.Fatalf("approved review should initially be ready: %+v, %v", before, err)
+	}
+	if _, err = f.db.Exec(`UPDATE group_database_access SET access_level='VIEW_EDIT' WHERE group_id=$1 AND database_id=$2`, f.group2, f.databaseID); err != nil {
+		t.Fatal(err)
+	}
+	after, err := f.svc.ReviewStatus(ctx, f.user1, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Ready {
+		t.Fatal("readiness still true after approval snapshot access level changed")
+	}
+	if _, err := f.svc.ApprovedRevision(ctx, d.ID); !errors.Is(err, ErrApprovalIncomplete) {
+		t.Fatalf("enqueue gate must reject changed access snapshot: %v", err)
 	}
 }
