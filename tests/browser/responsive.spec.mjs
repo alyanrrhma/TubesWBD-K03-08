@@ -214,9 +214,32 @@ test("authenticated SPA pages remain usable at configured viewport", async ({ pa
     await page.getByRole("button", { name: "Analisis execution plan" }).click();
     await expect(page.locator("#migration-plan")).toBeVisible();
     await expect(page.locator("#migration-plan-output")).not.toBeEmpty();
-    await page.goto(`/databases/${connectionID}`);
+    await page.goto(`/databases/${connectionID}?schema=public`);
     await expect(page.getByText(tableName, { exact: false }).first()).toBeVisible();
+    await page.getByRole("link", { name: "customers" }).click();
+    await expect(page.getByRole("heading", { name: "public.customers" })).toBeVisible();
+    await page.getByRole("link", { name: "Data", exact: true }).click();
+    await expect(page.getByText("Baris 1–50 dari 1000")).toBeVisible();
     await expectNoViewportOverflow(page);
+
+    await page.goto(`/databases/${connectionID}/migrations`);
+    const batchForm = page.locator("[data-create-form-wrapper] [data-revision-form]");
+    await batchForm.locator('[name="name"]').fill(`browser batch migration ${suffix}`);
+    await batchForm.locator('[name="description"]').fill("Playwright batch worker verification");
+    await batchForm.locator('[name="up_sql"]').fill("-- dbmp:batch table=customers size=250\nUPDATE customers SET name=name WHERE id=ANY($1::bigint[])");
+    await batchForm.locator('[name="down_sql"]').fill("UPDATE customers SET name=name WHERE id=ANY($1::bigint[])");
+    await batchForm.getByRole("button", { name: "Simpan revision draft" }).click();
+    await expect(page.getByRole("heading", { name: `browser batch migration ${suffix}` })).toBeVisible();
+    await page.getByRole("button", { name: "Kirim untuk review" }).click();
+    await expect(page.getByRole("button", { name: "Setujui" })).toBeVisible();
+    await page.getByRole("button", { name: "Setujui" }).click();
+    await expect(page.getByText("Semua persyaratan review terpenuhi.")).toBeVisible();
+    await page.once("dialog", dialog => dialog.accept());
+    await page.getByRole("button", { name: "Antrekan eksekusi yang disetujui" }).click();
+    const batchJob = await waitForVisibleJob(page);
+    expect(batchJob.mode).toBe("batch");
+    expect(batchJob.batches_done).toBe(4);
+    expect(batchJob.rows_done).toBe(1000);
 
     await page.goto("/admin/users");
     const helperUserRow = page.getByRole("row").filter({ hasText: helperUsername });
